@@ -3288,6 +3288,24 @@ async def _fetch_anilist_episode_count(anilist_id: int) -> Optional[int]:
     return None
 
 
+async def _fetch_anilist_single_title(anilist_id: int) -> Optional[str]:
+    """Fallback: get the best English/romaji title directly from AniList."""
+    gql = """
+    query ($id: Int) {
+        Media(id: $id, type: ANIME) {
+            title { romaji english native }
+        }
+    }
+    """
+    try:
+        data = await _anilist_query(gql, {"id": anilist_id})
+        media = data.get("Media") or {}
+        t = (media.get("title") or {}).get("english") or (media.get("title") or {}).get("romaji")
+        return t
+    except Exception:
+        return None
+
+
 async def _anizone_lookup_slug(anilist_id: int, title_candidates: Optional[list[str]] = None) -> Optional[str]:
     """Resolve AniList ID to anizone slug via title search.
     Uses AniList title → AniZone search → score matching.
@@ -3311,6 +3329,10 @@ async def _anizone_lookup_slug(anilist_id: int, title_candidates: Optional[list[
         titles = list(title_candidates or [])
         if not titles:
             titles = await _animekai_title_candidates(anilist_id)
+        if not titles:
+            title = await _fetch_anilist_single_title(anilist_id)
+            if title:
+                titles = [title]
         seen_lower = set()
         unique_titles = []
         for t in titles:
