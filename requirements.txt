@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+beautifulsoup4
+curl_cffi
+cloudscraper
+pycryptodome
+wasmtime
+redis>=4.0,<5
