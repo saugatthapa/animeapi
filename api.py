@@ -1,6 +1,6 @@
 import asyncio, base64, json, gzip, httpx, os, re, time
 from copy import deepcopy
-from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -3552,6 +3552,16 @@ async def _anizone_prewarm_episodes(anilist_id: int, slug: str, max_eps: int = 3
         print(f"[ANIZONE PREWARM] {anilist_id} ({slug}) already cached, skipped")
 
 
+async def _anizone_try_prewarm(anilist_id: int):
+    """Fire-and-forget: lookup slug and prewarm first episodes without blocking caller."""
+    try:
+        slug = await _anizone_lookup_slug(anilist_id)
+        if slug:
+            await _anizone_prewarm_episodes(anilist_id, slug, 3)
+    except Exception as exc:
+        print(f"[ANIZONE PREWARM WARN] {anilist_id}: {exc}")
+
+
 @app.get("/anizone/anilist/{anilist_id}/{ep_num}")
 async def anizone_by_anilist(anilist_id: int, ep_num: int):
     """Fetch anizone episode source using AniList ID (matches frontend AnimePlayer.jsx call)."""
@@ -4487,17 +4497,13 @@ async def get_episodes_by_mal_slug(mal_id: int):
 async def get_episodes(
     anilist_id: int,
     malId: Optional[int] = Query(None, description="Optional MAL ID to use only if the AniList lookup fails"),
-    background_tasks: BackgroundTasks = None,
 ):
     """Get the episode list for an anime, with MAL backup only after AniList fails."""
     async def fetch_fn():
         data, error = await _try_episode_fetch({"anilistId": anilist_id})
         if data is not None:
-            # Fire background prewarm to cache first 3 AniZone episode sources
-            if background_tasks is not None:
-                slug = await _anizone_lookup_slug(anilist_id)
-                if slug:
-                    background_tasks.add_task(_anizone_prewarm_episodes, anilist_id, slug, 3)
+            # Fire-and-forget prewarm: don't block the episodes response on slug lookup
+            asyncio.create_task(_anizone_try_prewarm(anilist_id))
             return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
 
         animekai_only = await _animekai_only_episode_payload(anilist_id)
