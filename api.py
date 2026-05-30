@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
+from curl_cffi.requests.exceptions import Timeout as CurlTimeout, RequestException
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 import functools, random
 
@@ -3006,18 +3007,32 @@ async def _animekai_fetch_text(path: str, extra_headers: Optional[dict] = None) 
             url,
             headers=headers,
             impersonate="chrome124",
-            timeout=20,
+            timeout=8,
             allow_redirects=True,
         )
 
-    response = await asyncio.to_thread(_request)
+    try:
+        response = await asyncio.to_thread(_request)
+    except CurlTimeout as e:
+        print(f"[ANIMEKAI TIMEOUT] {url}: {e}")
+        return ""
+    except RequestException as e:
+        print(f"[ANIMEKAI REQUEST ERROR] {url}: {e}")
+        return ""
+    except Exception as e:
+        print(f"[ANIMEKAI UNKNOWN ERROR] {url}: {e}")
+        return ""
+
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=f"AniKai request failed: {response.status_code}")
-    return response.text
+        print(f"[ANIMEKAI HTTP {response.status_code}] {url}")
+        return ""
+
+    return response.text or ""
 
 
 async def _animekai_fetch_soup(path: str, extra_headers: Optional[dict] = None) -> BeautifulSoup:
-    return BeautifulSoup(await _animekai_fetch_text(path, extra_headers=extra_headers), "html.parser")
+    html = await _animekai_fetch_text(path, extra_headers=extra_headers)
+    return BeautifulSoup(html or "", "html.parser")
 
 
 def _animekai_text(node, selector: str) -> str:
@@ -3183,9 +3198,15 @@ def _title_candidates_from_episode_payload(data: dict) -> list[str]:
 
 
 async def _inject_animekai_provider(data: dict, anilist_id: int) -> dict:
-    provider = await _animekai_build_provider(anilist_id)
+    try:
+        provider = await asyncio.wait_for(_animekai_build_provider(anilist_id), timeout=8)
+    except Exception as e:
+        print(f"[ANIMEKAI WARN] Failed to inject provider for {anilist_id}: {e}")
+        return data
+
     if provider is None:
         return data
+
     providers = data.setdefault("providers", {})
     providers["animekai"] = deepcopy(provider)
     return data
@@ -3411,6 +3432,15 @@ async def anizone_by_anilist(anilist_id: int, ep_num: int):
         "url": data["streams"][0]["url"] if data.get("streams") else "",
         "subtitles": data.get("subtitles", []),
     }
+
+
+@app.get("/anizone/mal/{mal_id}/{ep_num}")
+async def anizone_by_mal(mal_id: int, ep_num: int):
+    """Fetch anizone episode source using MAL ID."""
+    resolution = await _resolve_mal_to_anilist(mal_id)
+    if not resolution:
+        return _mal_mapping_required_response(mal_id)
+    return await anizone_by_anilist(resolution["anilistId"], ep_num)
 
 
 async def _animekai_only_episode_payload(anilist_id: int) -> Optional[dict]:
@@ -4284,7 +4314,6 @@ async def get_episodes_by_mal_slug(mal_id: int):
         "source": backup["source"],
         "anilistId": backup["anilistId"],
     }
-    data = await _inject_extra_stream_providers(data, backup["anilistId"])
     return _proxy_deep_images(_inject_mal_source_slugs(data, mal_id))
 
 
@@ -4401,13 +4430,18 @@ async def get_watch_sources(provider: str, anilist_id: str, category: str, slug:
         return await get_sources(episodeId=target_id, provider="animekai", anilistId=resolved_anilist_id, category=category)
 
     data = await _fetch_raw_episodes(resolved_anilist_id)
-    data = await _inject_extra_stream_providers(data, resolved_anilist_id)
     target_id = _resolve_slug_to_episode_id(data, provider, category, slug)
 
     if not target_id:
         raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
 
-    return await get_sources(episodeId=target_id, provider=provider, anilistId=resolved_anilist_id, category=category)
+    try:
+        return await get_sources(episodeId=target_id, provider=provider, anilistId=resolved_anilist_id, category=category)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[WATCH WARN] Provider {provider} failed for {anilist_id}: {e}")
+        return {"streams": [], "subtitles": [], "provider": provider, "error": "Provider unavailable"}
 
 
 @app.get("/watch-by-mal/{malId}/{provider}/{category}/{episodeId:path}")
@@ -4434,17 +4468,22 @@ async def get_watch_sources_by_mal(malId: int, provider: str, category: str, epi
         return await get_sources(episodeId=target_id, provider="animekai", anilistId=anilist_id, category=category)
 
     data = await _fetch_raw_episodes(anilist_id)
-    data = await _inject_extra_stream_providers(data, anilist_id)
     target_id = _resolve_slug_to_episode_id(data, provider, category, episodeId)
     if not target_id:
         raise HTTPException(status_code=404, detail=f"Episode slug '{episodeId}' not found for provider {provider}")
 
-    return await get_sources(
-        episodeId=target_id,
-        provider=provider,
-        anilistId=anilist_id,
-        category=category,
-    )
+    try:
+        return await get_sources(
+            episodeId=target_id,
+            provider=provider,
+            anilistId=anilist_id,
+            category=category,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[WATCH WARN] Provider {provider} failed for {anilist_id}: {e}")
+        return {"streams": [], "subtitles": [], "provider": provider, "error": "Provider unavailable"}
 
 
 # ─── Health / Debug Endpoints ──────────────────────────────────────────
