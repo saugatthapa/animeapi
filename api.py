@@ -3355,12 +3355,26 @@ async def _anizone_lookup_slug(anilist_id: int, title_candidates: Optional[list[
                     print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (exact) in {time.time()-t0:.2f}s")
                     return r["slug"]
 
-            # Substring match (one-direction containment)
+            # Contains match
             for r in results:
                 rt = r.get("title", "").lower()
                 if rt and (title_lower in rt or rt in title_lower):
                     _set_cache("anizone_lookup", cache_key, r["slug"], ttl_hours=24)
                     print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (contains) in {time.time()-t0:.2f}s")
+                    return r["slug"]
+
+            # Word overlap match (≥2 common words or one title fully covered)
+            for r in results:
+                rt = r.get("title", "").lower()
+                if not rt:
+                    continue
+                tw = set(title_lower.split())
+                rw = set(rt.split())
+                common = tw & rw
+                min_len = min(len(tw), len(rw))
+                if min_len >= 2 and len(common) >= min_len - 1:
+                    _set_cache("anizone_lookup", cache_key, r["slug"], ttl_hours=24)
+                    print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (word overlap) in {time.time()-t0:.2f}s")
                     return r["slug"]
 
         _set_cache("anizone_lookup", cache_key, _ANIZONE_SLUG_FAILURE, ttl_hours=0.25)
