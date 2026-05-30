@@ -18,12 +18,12 @@ ANIZONE_HEADERS = {"User-Agent": ANIZONE_UA, "Accept": "text/html, */*", "Accept
 router = APIRouter(prefix="/anizone", tags=["AniZone"])
 
 
-def _fetch(url: str, referer: str = "", params: dict | None = None) -> str:
+def _fetch(url: str, referer: str = "", params: dict | None = None, timeout: float = 30.0) -> str:
     headers = dict(ANIZONE_HEADERS)
     if referer:
         headers["Referer"] = referer
     try:
-        with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as c:
             r = c.get(url, headers=headers, params=params or {})
     except Exception as e:
         raise HTTPException(502, f"Fetch failed: {e}")
