@@ -1,12 +1,7 @@
-"""Production entry point — run with: python run.py"""
-import uvicorn
+"""Patched API module entrypoint.
 
-if __name__ == "__main__":
-    uvicorn.run(
-        "api:app",
-        host="0.0.0.0",
-        port=16262,
-        workers=4,
-        proxy_headers=True,
-        forwarded_allow_ips="*",
-    )
+Use with your process manager/startup command:
+python -m uvicorn run:app --host 0.0.0.0 --port ${SERVER_PORT} --workers 4 --proxy-headers --forwarded-allow-ips='*'
+"""
+
+from api_patched import app
