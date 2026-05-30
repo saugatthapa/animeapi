@@ -126,43 +126,6 @@ async def safe_get_episodes_by_mal(malId: int):
     return await safe_get_episodes_by_mal_slug(malId)
 
 
-async def _anizone_slug_with_episode_titles(anilist_id: int) -> Optional[str]:
-    """Lookup AniZone slug with episode payload titles before falling back internally.
-
-    The original direct route only called _anizone_lookup_slug(anilist_id). Some shows
-    need the same title candidates that old provider injection supplied, so the direct
-    endpoint failed with 404 even though AniZone could work.
-    """
-    title_candidates = []
-    try:
-        payload = await _api._fetch_raw_episodes(anilist_id)
-        title_candidates = _api._title_candidates_from_episode_payload(payload)
-    except Exception as exc:
-        print(f"[ANIZONE LOOKUP WARN] Could not load episode title candidates for {anilist_id}: {exc}")
-
-    return await _api._anizone_lookup_slug(anilist_id, title_candidates)
-
-
-async def safe_anizone_by_anilist(anilist_id: int, ep_num: int):
-    slug = await _anizone_slug_with_episode_titles(anilist_id)
-    if not slug:
-        raise HTTPException(404, "AniZone slug not found")
-
-    episode_id = f"anizone:{slug}:{ep_num}"
-    data = await _api._anizone_sources_from_episode_id(episode_id, "sub")
-    return {
-        "url": data["streams"][0]["url"] if data.get("streams") else "",
-        "subtitles": data.get("subtitles", []),
-    }
-
-
-async def safe_anizone_by_mal(mal_id: int, ep_num: int):
-    resolution = await _api._resolve_mal_to_anilist(mal_id)
-    if not resolution:
-        return _api._mal_mapping_required_response(mal_id)
-    return await safe_anizone_by_anilist(resolution["anilistId"], ep_num)
-
-
 async def safe_get_watch_sources(provider: str, anilist_id: str, category: str, slug: str):
     """Resolve only the selected provider for AniList routes."""
     if isinstance(anilist_id, str) and anilist_id.startswith("mal-"):
@@ -298,9 +261,6 @@ _remove_route("/episodes/mal-{mal_id}")
 _remove_route("/episodes-by-mal/{malId}")
 _remove_route("/watch/{provider}/{anilist_id}/{category}/{slug:path}")
 _remove_route("/watch-by-mal/{malId}/{provider}/{category}/{episodeId:path}")
-_remove_route("/anizone/anilist/{anilist_id}/{ep_num}")
-_remove_route("/anizone/mal/{mal_id}/{ep_num}")
-
 app.add_api_route(
     "/episodes/mal-{mal_id}",
     safe_get_episodes_by_mal_slug,
@@ -321,18 +281,8 @@ app.add_api_route(
     safe_get_watch_sources_by_mal,
     methods=["GET"],
 )
-app.add_api_route(
-    "/anizone/anilist/{anilist_id}/{ep_num}",
-    safe_anizone_by_anilist,
-    methods=["GET"],
-)
-app.add_api_route(
-    "/anizone/mal/{mal_id}/{ep_num}",
-    safe_anizone_by_mal,
-    methods=["GET"],
-)
 
 # Keep specific MAL episodes above the generic /episodes/{anilist_id} route.
 _move_route_before("/episodes/mal-{mal_id}", "/episodes/{anilist_id}")
 
-print("[API PATCH] Safe watch routes, fast MAL episodes, stronger AniZone direct lookup, and AnimeKai timeout handling enabled.")
+print("[API PATCH] Safe watch routes, fast MAL episodes, and AnimeKai timeout handling enabled.")

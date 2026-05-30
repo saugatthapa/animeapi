@@ -187,19 +187,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── AniZone Module ──────────────────────────────────────────────────────
-from anizone_unified import router as anizone_router
-from anizone_unified import (
-    ANIZONE_BASE,
-    _fetch as _anizone_fetch,
-    _parse_search as _anizone_parse_search,
-    _parse_episode as _anizone_parse_episode,
-    _parse_total_pages as _anizone_parse_total_pages,
-    _parse_episode_cards as _anizone_parse_episode_cards,
-    _parse_episodes_from_scripts as _anizone_parse_episodes_from_scripts,
-)
 
-app.include_router(anizone_router)
 
 def _has_valid_api_key(request: Request) -> bool:
     api_key = request.headers.get(API_KEY_NAME)
@@ -327,18 +315,6 @@ class _CacheEntry:
 
 _memory_cache: dict[str, dict[str, _CacheEntry]] = {}
 
-# Sentinel for failed slug lookups (distinct from None which means "not computed yet")
-_ANIZONE_SLUG_FAILURE = object()
-
-# Stampede protection: prevents multiple concurrent scrapes of the same slug/episode
-_anizone_stampede_locks: dict[str, asyncio.Lock] = {}
-
-def _anizone_stampede_lock(key: str) -> asyncio.Lock:
-    """Get or create a per-key asyncio lock for stampede prevention."""
-    if key not in _anizone_stampede_locks:
-        _anizone_stampede_locks[key] = asyncio.Lock()
-    return _anizone_stampede_locks[key]
-
 def _get_cache(cache_type: str, key: str):
     """Synchronous in-memory cache for internal functions."""
     bucket = _memory_cache.get(cache_type)
@@ -356,27 +332,6 @@ def _set_cache(cache_type: str, key: str, data, ttl_hours: int):
     """Synchronous in-memory cache for internal functions."""
     bucket = _memory_cache.setdefault(cache_type, {})
     bucket[key] = _CacheEntry(data, ttl_hours)
-
-
-def _anizone_get_stale_cache_entry(cache_type: str, key: str):
-    """Get cache entry with stale-while-revalidate pattern.
-    The main cache stores data with 6h TTL for stale fallback.
-    A separate fresh-marker bucket stores a boolean with 30min TTL.
-    Returns (data, is_fresh) — data may be None if not cached at all.
-    """
-    bucket = _memory_cache.get(cache_type)
-    if not bucket:
-        return None, False
-    entry = bucket.get(key)
-    if not entry:
-        return None, False
-    if entry.is_expired():
-        return None, False  # data expired even for stale fallback
-    # Check if it's in the fresh window (fresh marker exists and not expired)
-    fresh_bucket = _memory_cache.get(f"{cache_type}_fresh")
-    fresh_marker = fresh_bucket.get(key) if fresh_bucket else None
-    is_fresh = fresh_marker is not None and not fresh_marker.is_expired()
-    return entry.data, is_fresh
 
 
 # ─── Timing / Profiling ─────────────────────────────────────────────────
@@ -3218,30 +3173,6 @@ async def _animekai_build_provider(anilist_id: int) -> Optional[dict]:
     return provider
 
 
-def _title_candidates_from_episode_payload(data: dict) -> list[str]:
-    candidates = []
-
-    def add(value):
-        if isinstance(value, str) and value.strip() and value.strip() not in candidates:
-            candidates.append(value.strip())
-
-    mappings = data.get("mappings") if isinstance(data, dict) else {}
-    if isinstance(mappings, dict):
-        add(mappings.get("title"))
-        for value in mappings.get("synonyms") or []:
-            add(value)
-
-    for key in ("title", "english", "romaji", "native"):
-        add(data.get(key) if isinstance(data, dict) else None)
-
-    title_obj = data.get("title") if isinstance(data, dict) else None
-    if isinstance(title_obj, dict):
-        for key in ("english", "romaji", "native"):
-            add(title_obj.get(key))
-
-    return candidates
-
-
 async def _inject_animekai_provider(data: dict, anilist_id: int) -> dict:
     try:
         provider = await asyncio.wait_for(_animekai_build_provider(anilist_id), timeout=8)
@@ -3260,7 +3191,6 @@ async def _inject_animekai_provider(data: dict, anilist_id: int) -> dict:
 async def _inject_extra_stream_providers(data: dict, anilist_id: int) -> dict:
     t0 = time.time()
     data = await _inject_animekai_provider(data, anilist_id)
-    data = await _inject_anizone_provider(data, anilist_id)
     _log_timing(f"_inject_extra_stream_providers({anilist_id})", t0)
     return data
 
@@ -3286,329 +3216,6 @@ async def _fetch_anilist_episode_count(anilist_id: int) -> Optional[int]:
     except Exception:
         pass
     return None
-
-
-async def _fetch_anilist_single_title(anilist_id: int) -> Optional[str]:
-    """Fallback: get the best English/romaji title directly from AniList."""
-    gql = """
-    query ($id: Int) {
-        Media(id: $id, type: ANIME) {
-            title { romaji english native }
-        }
-    }
-    """
-    try:
-        data = await _anilist_query(gql, {"id": anilist_id})
-        media = data.get("Media") or {}
-        t = (media.get("title") or {}).get("english") or (media.get("title") or {}).get("romaji")
-        return t
-    except Exception:
-        return None
-
-
-async def _anizone_lookup_slug(anilist_id: int, title_candidates: Optional[list[str]] = None) -> Optional[str]:
-    """Resolve AniList ID to anizone slug via title search.
-    Uses AniList title → AniZone search → score matching.
-    No per-result page fetches. Cache: 24h on success, 15min on failure."""
-    cache_key = f"anizone_slug:{anilist_id}"
-    cached = _get_cache("anizone_lookup", cache_key)
-    if cached is not None:
-        if cached is _ANIZONE_SLUG_FAILURE:
-            return None
-        return cached
-
-    lock = _anizone_stampede_lock(f"slug:{anilist_id}")
-    async with lock:
-        cached = _get_cache("anizone_lookup", cache_key)
-        if cached is not None:
-            if cached is _ANIZONE_SLUG_FAILURE:
-                return None
-            return cached
-
-        t0 = time.time()
-        titles = list(title_candidates or [])
-        if not titles:
-            titles = await _animekai_title_candidates(anilist_id)
-        if not titles:
-            title = await _fetch_anilist_single_title(anilist_id)
-            if title:
-                titles = [title]
-        seen_lower = set()
-        unique_titles = []
-        for t in titles:
-            if t and t.lower() not in seen_lower:
-                seen_lower.add(t.lower())
-                unique_titles.append(t)
-
-        for title in unique_titles:
-            try:
-                html = await _anizone_fetch(f"{ANIZONE_BASE}/anime", f"{ANIZONE_BASE}/", {"search": title, "page": "1"}, 8.0)
-            except Exception:
-                continue
-            results = _anizone_parse_search(html)
-            title_lower = title.lower()
-
-            # Exact match → return immediately
-            for r in results:
-                if r.get("title", "").lower() == title_lower:
-                    _set_cache("anizone_lookup", cache_key, r["slug"], ttl_hours=24)
-                    print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (exact) in {time.time()-t0:.2f}s")
-                    return r["slug"]
-
-            # Contains match
-            for r in results:
-                rt = r.get("title", "").lower()
-                if rt and (title_lower in rt or rt in title_lower):
-                    _set_cache("anizone_lookup", cache_key, r["slug"], ttl_hours=24)
-                    print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (contains) in {time.time()-t0:.2f}s")
-                    return r["slug"]
-
-            # Word overlap match (≥2 common words or one title fully covered)
-            for r in results:
-                rt = r.get("title", "").lower()
-                if not rt:
-                    continue
-                tw = set(title_lower.split())
-                rw = set(rt.split())
-                common = tw & rw
-                min_len = min(len(tw), len(rw))
-                if min_len >= 2 and len(common) >= min_len - 1:
-                    _set_cache("anizone_lookup", cache_key, r["slug"], ttl_hours=24)
-                    print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (word overlap) in {time.time()-t0:.2f}s")
-                    return r["slug"]
-
-        _set_cache("anizone_lookup", cache_key, _ANIZONE_SLUG_FAILURE, ttl_hours=0.083)  # 5 min failure cache
-        print(f"[ANIZONE SLUG MISS] No slug for anilist_id={anilist_id} in {time.time()-t0:.2f}s")
-        return None
-
-
-async def _anizone_build_provider(anilist_id: int, title_candidates: Optional[list[str]] = None) -> Optional[dict]:
-    cache_key = f"v2:{anilist_id}"
-    cached = _get_cache("anizone_provider", cache_key)
-    if cached is not None:
-        return cached
-
-    slug = await _anizone_lookup_slug(anilist_id, title_candidates)
-    if not slug:
-        return None
-    try:
-        html = await _anizone_fetch(f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime")
-        total_pages = _anizone_parse_total_pages(html)
-        seen_nums = set()
-        all_episodes = []
-        soup = BeautifulSoup(html, "html.parser")
-        _anizone_parse_episode_cards(soup, slug, all_episodes, seen_nums)
-        _anizone_parse_episodes_from_scripts(soup, slug, all_episodes, seen_nums)
-        for page in range(2, total_pages + 1):
-            try:
-                page_html = await _anizone_fetch(
-                    f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime",
-                    {"page": str(page)},
-                )
-                page_soup = BeautifulSoup(page_html, "html.parser")
-                _anizone_parse_episode_cards(page_soup, slug, all_episodes, seen_nums)
-                _anizone_parse_episodes_from_scripts(page_soup, slug, all_episodes, seen_nums)
-            except Exception:
-                break
-        all_episodes.sort(key=lambda e: e["number"])
-        scraped_max = max(e["number"] for e in all_episodes) if all_episodes else 0
-    except Exception:
-        scraped_max = 0
-        all_episodes = []
-
-    known_total = await _fetch_anilist_episode_count(anilist_id)
-    if known_total and known_total > scraped_max:
-        existing_nums = {e["number"] for e in all_episodes}
-        for num in range(1, known_total + 1):
-            if num not in existing_nums:
-                all_episodes.append({
-                    "number": num,
-                    "title": f"Episode {num}",
-                    "image": "",
-                })
-        all_episodes.sort(key=lambda e: e["number"])
-    sub_episodes = []
-    for ep in all_episodes:
-        num = ep.get("number")
-        if num is None:
-            continue
-        sub_episodes.append({
-            "id": f"anizone:{slug}:{num}",
-            "title": ep.get("title") or f"Episode {num}",
-            "number": num,
-            "image": ep.get("image") or "",
-        })
-    if not sub_episodes:
-        return None
-    result = {
-        "id": "anizone", "name": "AniZone",
-        "episodes": {"sub": sub_episodes, "dub": list(sub_episodes)},
-    }
-    _set_cache("anizone_provider", cache_key, result, ttl_hours=6)
-    return result
-
-
-async def _inject_anizone_provider(data: dict, anilist_id: int) -> dict:
-    provider = await _anizone_build_provider(anilist_id, _title_candidates_from_episode_payload(data))
-    if provider is None:
-        return data
-    providers = data.setdefault("providers", {})
-    providers["anizone"] = deepcopy(provider)
-    return data
-
-
-async def _anizone_sources_from_episode_id(episode_id: str, category: str) -> dict:
-    parts = str(episode_id or "").split(":")
-    if len(parts) != 3 or parts[0] != "anizone":
-        raise HTTPException(422, "Invalid AniZone episode id")
-    slug, ep_num = parts[1], parts[2]
-    cache_key = f"{slug}:{ep_num}:{category}"
-
-    # Stale-while-revalidate: return fresh data instantly, stale data with bg refresh
-    data, is_fresh = _anizone_get_stale_cache_entry("anizone_episode", cache_key)
-    if data is not None:
-        if is_fresh:
-            print(f"[ANIZONE CACHE] Hit {slug} ep={ep_num} ({category})")
-            return data
-        # Stale data — return it but trigger async refresh
-        print(f"[ANIZONE STALE] Returning stale for {slug} ep={ep_num} ({category})")
-        asyncio.create_task(_anizone_refresh_episode_cache(cache_key, slug, ep_num, category))
-        return data
-
-    # Fresh fetch with stampede lock
-    lock = _anizone_stampede_lock(f"ep:{cache_key}")
-    async with lock:
-        data, is_fresh = _anizone_get_stale_cache_entry("anizone_episode", cache_key)
-        if data is not None and is_fresh:
-            return data
-        return await _anizone_fetch_and_cache_episode(cache_key, slug, ep_num, category)
-
-
-async def _anizone_fetch_and_cache_episode(cache_key: str, slug: str, ep_num: str, category: str) -> dict:
-    """Fetch episode page from AniZone, parse, cache with 30min fresh + 6h stale, return result."""
-    t0 = time.time()
-    referer = f"{ANIZONE_BASE}/anime/{slug}/{ep_num}"
-    try:
-        html = await _anizone_fetch(referer, f"{ANIZONE_BASE}/anime/{slug}", {}, 12.0)
-    except Exception as exc:
-        print(f"[ANIZONE FETCH ERROR] {slug} ep={ep_num}: {exc}")
-        return {"streams": [], "subtitles": [], "provider": "anizone", "error": str(exc)}
-    try:
-        stream_data = _anizone_parse_episode(html)
-    except Exception as exc:
-        print(f"[ANIZONE PARSE ERROR] {slug} ep={ep_num}: {exc}")
-        return {"streams": [], "subtitles": [], "provider": "anizone", "error": str(exc)}
-    original_url = stream_data.get("url_original", "")
-    result = {
-        "streams": [{"url": original_url, "type": "hls", "quality": "auto", "referer": ANIZONE_BASE}],
-        "subtitles": [
-            {"url": s.get("url_original", s.get("url", "")), "label": s.get("label", ""), "kind": s.get("kind", "")}
-            for s in stream_data.get("subtitles", [])
-        ],
-        "provider": "anizone",
-    }
-    # Store with a short fresh TTL + keep in cache for stale fallback
-    _set_cache("anizone_episode", cache_key, result, ttl_hours=6)
-    # Also store in a "fresh" marker bucket with 30min TTL
-    _set_cache("anizone_episode_fresh", cache_key, True, ttl_hours=0.5)
-    print(f"[ANIZONE FETCH] {slug} ep={ep_num} ({category}) in {time.time()-t0:.2f}s")
-    return result
-
-
-async def _anizone_refresh_episode_cache(cache_key: str, slug: str, ep_num: str, category: str):
-    """Background refresh of stale episode cache entry."""
-    lock = _anizone_stampede_lock(f"refresh:{cache_key}")
-    if lock.locked():
-        return  # another refresh already in progress
-    async with lock:
-        data, is_fresh = _anizone_get_stale_cache_entry("anizone_episode", cache_key)
-        if is_fresh:
-            return  # already refreshed by another task
-        await _anizone_fetch_and_cache_episode(cache_key, slug, ep_num, category)
-
-
-async def _anizone_prewarm_episodes(anilist_id: int, slug: str, max_eps: int = 3):
-    """Background prewarm: fetch and cache the first few episode sources after episodes list loads."""
-    t0 = time.time()
-    tasks = []
-    for ep_num in range(1, max_eps + 1):
-        cache_key = f"{slug}:{ep_num}:sub"
-        data, is_fresh = _anizone_get_stale_cache_entry("anizone_episode", cache_key)
-        if data is not None and is_fresh:
-            continue  # already cached and fresh, skip
-        tasks.append(_anizone_fetch_and_cache_episode(cache_key, slug, str(ep_num), "sub"))
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-        print(f"[ANIZONE PREWARM] {anilist_id} ({slug}) eps 1-{max_eps} in {time.time()-t0:.2f}s")
-    else:
-        print(f"[ANIZONE PREWARM] {anilist_id} ({slug}) already cached, skipped")
-
-
-async def _anizone_try_prewarm(anilist_id: int):
-    """Fire-and-forget: lookup slug and prewarm first episodes without blocking caller."""
-    try:
-        slug = await _anizone_lookup_slug(anilist_id)
-        if slug:
-            await _anizone_prewarm_episodes(anilist_id, slug, 3)
-    except Exception as exc:
-        print(f"[ANIZONE PREWARM WARN] {anilist_id}: {exc}")
-
-
-@app.get("/anizone/anilist/{anilist_id}/{ep_num}")
-async def anizone_by_anilist(anilist_id: int, ep_num: int):
-    """Fetch anizone episode source using AniList ID (matches frontend AnimePlayer.jsx call)."""
-    slug = await _anizone_lookup_slug(anilist_id)
-    if not slug:
-        raise HTTPException(404, "AniZone slug not found")
-    episode_id = f"anizone:{slug}:{ep_num}"
-    data = await _anizone_sources_from_episode_id(episode_id, "sub")
-    return {
-        "url": data["streams"][0]["url"] if data.get("streams") else "",
-        "subtitles": data.get("subtitles", []),
-    }
-
-
-@app.get("/anizone/mal/{mal_id}/{ep_num}")
-async def anizone_by_mal(mal_id: int, ep_num: int):
-    """Fetch anizone episode source using MAL ID."""
-    resolution = await _resolve_mal_to_anilist(mal_id)
-    if not resolution:
-        return _mal_mapping_required_response(mal_id)
-    return await anizone_by_anilist(resolution["anilistId"], ep_num)
-
-
-@app.get("/health/anizone/{anilist_id}/{ep_num}")
-async def health_anizone(anilist_id: int, ep_num: int):
-    """Debug endpoint: check AniZone cache status and optionally scrape."""
-    t0 = time.time()
-    slug_cache_key = f"anizone_slug:{anilist_id}"
-    slug_data = _get_cache("anizone_lookup", slug_cache_key)
-    slug_status = "cached" if slug_data is not None and slug_data is not _ANIZONE_SLUG_FAILURE else "not_cached"
-    if slug_data is _ANIZONE_SLUG_FAILURE:
-        slug_status = "failed"
-
-    slug = slug_data if slug_data is not None and slug_data is not _ANIZONE_SLUG_FAILURE else None
-
-    ep_cache_key = f"{slug}:{ep_num}:sub" if slug else None
-    ep_status = "not_cached"
-    ep_fresh = False
-    if ep_cache_key:
-        ep_data, ep_fresh = _anizone_get_stale_cache_entry("anizone_episode", ep_cache_key)
-        if ep_data is not None and ep_fresh:
-            ep_status = "fresh"
-        elif ep_data is not None:
-            ep_status = "stale"
-
-    return {
-        "anilist_id": anilist_id,
-        "ep_num": ep_num,
-        "slug": slug,
-        "slug_status": slug_status,
-        "episode_cache_status": ep_status,
-        "episode_cache_fresh": ep_fresh,
-        "elapsed_ms": round((time.time() - t0) * 1000),
-        "note": "Use /anizone/anilist/{anilist_id}/{ep_num} to trigger a fetch",
-    }
 
 
 async def _animekai_only_episode_payload(anilist_id: int) -> Optional[dict]:
@@ -4494,13 +4101,10 @@ async def get_episodes(
     async def fetch_fn():
         data, error = await _try_episode_fetch({"anilistId": anilist_id})
         if data is not None:
-            # Fire-and-forget prewarm: don't block the episodes response on slug lookup
-            asyncio.create_task(_anizone_try_prewarm(anilist_id))
             return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
 
         animekai_only = await _animekai_only_episode_payload(anilist_id)
         if animekai_only is not None:
-            animekai_only = await _inject_anizone_provider(animekai_only, anilist_id)
             return _proxy_deep_images(_inject_source_slugs(animekai_only, anilist_id))
 
         if malId is None:
@@ -4536,9 +4140,6 @@ async def get_sources(
     category: str = Query("sub", description="sub or dub"),
 ):
     """Get M3U8 streaming sources for a specific episode."""
-    if provider == "anizone":
-        data = await _anizone_sources_from_episode_id(episodeId, category)
-        return _proxy_deep_images(data)
     if _is_animekai_provider(provider):
         data = await _animekai_sources_from_episode_id(episodeId, category)
         data = await _attach_stream_proxy_candidates(data)
