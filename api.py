@@ -392,12 +392,16 @@ def _log_timing(name: str, start: float):
 
 # ─── API Response Caching Helper ───────────────────────────────────────
 async def _cached_response(prefix: str, ttl_seconds: int, fetch_fn, *key_parts):
-    """Wrap an async endpoint with Redis caching + stale fallback + timing."""
+    """Wrap an async endpoint with Redis caching + stale fallback + timing.
+    Falls back to in-memory cache when Redis is unavailable."""
     t0 = time.time()
     r = await _get_redis()
     key = _redis_key(prefix, *key_parts)
     lock_key = f"lock:{key}"
     stale_key = f"stale:{key}"
+
+    # In-memory fallback when Redis is unavailable
+    mem_cache_key = f"_cached:{key}"
 
     # 1. Check live cache
     if r:
@@ -410,6 +414,13 @@ async def _cached_response(prefix: str, ttl_seconds: int, fetch_fn, *key_parts):
                 return {**result, "cached": True, "response_time_ms": round(elapsed)}
         except Exception:
             pass
+    else:
+        # In-memory fallback
+        cached = _get_cache("_cached_response", mem_cache_key)
+        if cached is not None:
+            elapsed = (time.time() - t0) * 1000
+            print(f"[CACHE] MEM HIT {key} ({elapsed:.0f}ms)")
+            return {**cached, "cached": True, "response_time_ms": round(elapsed)}
 
     # 2. Try stale fallback
     stale_data = None
@@ -455,6 +466,9 @@ async def _cached_response(prefix: str, ttl_seconds: int, fetch_fn, *key_parts):
                 await r.setex(stale_key, ttl_seconds * 2, json.dumps(fresh, default=str))
             except Exception:
                 pass
+        else:
+            # In-memory fallback: cache with TTL converted to hours (minimum 0.25)
+            _set_cache("_cached_response", mem_cache_key, fresh, ttl_hours=max(0.25, ttl_seconds / 3600))
         print(f"[CACHE] MISS {key} ({elapsed:.0f}ms)")
         return result
     except Exception as e:
