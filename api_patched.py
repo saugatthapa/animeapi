@@ -1,11 +1,11 @@
 """Runtime safety patch layer for the main FastAPI app.
 
-This module imports the existing api.py app, then applies small targeted fixes
+This module imports the existing api.py app, then applies targeted fixes
 without touching the large api.py file directly:
 - selected /watch provider routes no longer run extra provider injection
 - /episodes MAL routes no longer run slow extra provider injection
 - AnimeKai network timeouts become non-fatal warnings
-- AniZone MAL route is supported
+- AniZone direct routes use stronger title-based lookup and MAL fallback support
 
 Run with: uvicorn api_patched:app
 """
@@ -126,12 +126,45 @@ async def safe_get_episodes_by_mal(malId: int):
     return await safe_get_episodes_by_mal_slug(malId)
 
 
-async def safe_get_watch_sources(provider: str, anilist_id: str, category: str, slug: str):
-    """Resolve only the selected provider for AniList routes.
+async def _anizone_slug_with_episode_titles(anilist_id: int) -> Optional[str]:
+    """Lookup AniZone slug with episode payload titles before falling back internally.
 
-    Important: do not call extra provider injection here. A Hop/Bee/Bonk
-    request should not fail just because AnimeKai is slow or unavailable.
+    The original direct route only called _anizone_lookup_slug(anilist_id). Some shows
+    need the same title candidates that old provider injection supplied, so the direct
+    endpoint failed with 404 even though AniZone could work.
     """
+    title_candidates = []
+    try:
+        payload = await _api._fetch_raw_episodes(anilist_id)
+        title_candidates = _api._title_candidates_from_episode_payload(payload)
+    except Exception as exc:
+        print(f"[ANIZONE LOOKUP WARN] Could not load episode title candidates for {anilist_id}: {exc}")
+
+    return await _api._anizone_lookup_slug(anilist_id, title_candidates)
+
+
+async def safe_anizone_by_anilist(anilist_id: int, ep_num: int):
+    slug = await _anizone_slug_with_episode_titles(anilist_id)
+    if not slug:
+        raise HTTPException(404, "AniZone slug not found")
+
+    episode_id = f"anizone:{slug}:{ep_num}"
+    data = await _api._anizone_sources_from_episode_id(episode_id, "sub")
+    return {
+        "url": data["streams"][0]["url"] if data.get("streams") else "",
+        "subtitles": data.get("subtitles", []),
+    }
+
+
+async def safe_anizone_by_mal(mal_id: int, ep_num: int):
+    resolution = await _api._resolve_mal_to_anilist(mal_id)
+    if not resolution:
+        return _api._mal_mapping_required_response(mal_id)
+    return await safe_anizone_by_anilist(resolution["anilistId"], ep_num)
+
+
+async def safe_get_watch_sources(provider: str, anilist_id: str, category: str, slug: str):
+    """Resolve only the selected provider for AniList routes."""
     if isinstance(anilist_id, str) and anilist_id.startswith("mal-"):
         try:
             mal_id = int(anilist_id.split("-", 1)[1])
@@ -230,13 +263,6 @@ async def safe_get_watch_sources_by_mal(malId: int, provider: str, category: str
         return _empty_provider_response(provider)
 
 
-async def anizone_by_mal(mal_id: int, ep_num: int):
-    resolution = await _api._resolve_mal_to_anilist(mal_id)
-    if not resolution:
-        return _api._mal_mapping_required_response(mal_id)
-    return await _api.anizone_by_anilist(resolution["anilistId"], ep_num)
-
-
 def _remove_route(path: str, method: str = "GET") -> None:
     app.router.routes = [
         route
@@ -245,11 +271,34 @@ def _remove_route(path: str, method: str = "GET") -> None:
     ]
 
 
+def _move_route_before(path: str, before_path: str, method: str = "GET") -> None:
+    """Move a just-added route before a more general route.
+
+    FastAPI matches routes in order. If /episodes/{anilist_id} appears before
+    /episodes/mal-{mal_id}, then /episodes/mal-21 is caught by the int route and
+    returns 422. This fixes that order after patch routes are registered.
+    """
+    routes = app.router.routes
+    target_index = next(
+        (i for i, route in enumerate(routes) if getattr(route, "path", None) == path and method in getattr(route, "methods", set())),
+        None,
+    )
+    if target_index is None:
+        return
+    route = routes.pop(target_index)
+    before_index = next(
+        (i for i, candidate in enumerate(routes) if getattr(candidate, "path", None) == before_path and method in getattr(candidate, "methods", set())),
+        len(routes),
+    )
+    routes.insert(before_index, route)
+
+
 # Replace original routes with safe versions.
 _remove_route("/episodes/mal-{mal_id}")
 _remove_route("/episodes-by-mal/{malId}")
 _remove_route("/watch/{provider}/{anilist_id}/{category}/{slug:path}")
 _remove_route("/watch-by-mal/{malId}/{provider}/{category}/{episodeId:path}")
+_remove_route("/anizone/anilist/{anilist_id}/{ep_num}")
 _remove_route("/anizone/mal/{mal_id}/{ep_num}")
 
 app.add_api_route(
@@ -273,9 +322,17 @@ app.add_api_route(
     methods=["GET"],
 )
 app.add_api_route(
+    "/anizone/anilist/{anilist_id}/{ep_num}",
+    safe_anizone_by_anilist,
+    methods=["GET"],
+)
+app.add_api_route(
     "/anizone/mal/{mal_id}/{ep_num}",
-    anizone_by_mal,
+    safe_anizone_by_mal,
     methods=["GET"],
 )
 
-print("[API PATCH] Safe watch routes, fast MAL episodes, AnimeKai timeout handling, and AniZone MAL route enabled.")
+# Keep specific MAL episodes above the generic /episodes/{anilist_id} route.
+_move_route_before("/episodes/mal-{mal_id}", "/episodes/{anilist_id}")
+
+print("[API PATCH] Safe watch routes, fast MAL episodes, stronger AniZone direct lookup, and AnimeKai timeout handling enabled.")
