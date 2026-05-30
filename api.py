@@ -3377,7 +3377,7 @@ async def _anizone_lookup_slug(anilist_id: int, title_candidates: Optional[list[
                     print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (word overlap) in {time.time()-t0:.2f}s")
                     return r["slug"]
 
-        _set_cache("anizone_lookup", cache_key, _ANIZONE_SLUG_FAILURE, ttl_hours=0.25)
+        _set_cache("anizone_lookup", cache_key, _ANIZONE_SLUG_FAILURE, ttl_hours=0.083)  # 5 min failure cache
         print(f"[ANIZONE SLUG MISS] No slug for anilist_id={anilist_id} in {time.time()-t0:.2f}s")
         return None
 
