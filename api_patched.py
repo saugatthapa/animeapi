@@ -3,6 +3,7 @@
 This module imports the existing api.py app, then applies small targeted fixes
 without touching the large api.py file directly:
 - selected /watch provider routes no longer run extra provider injection
+- /episodes MAL routes no longer run slow extra provider injection
 - AnimeKai network timeouts become non-fatal warnings
 - AniZone MAL route is supported
 
@@ -93,16 +94,42 @@ async def _safe_inject_animekai_provider(data: dict, anilist_id: int) -> dict:
     return data
 
 
-# Patch AnimeKai helper functions used by the imported app.
+async def _safe_noop_extra_stream_provider_injection(data: dict, anilist_id: int) -> dict:
+    """Never let background provider injection block /episodes or /watch routes."""
+    return data
+
+
+# Patch helper functions used by the imported app.
 _api._animekai_fetch_text = _safe_animekai_fetch_text
 _api._animekai_fetch_soup = _safe_animekai_fetch_soup
 _api._inject_animekai_provider = _safe_inject_animekai_provider
+_api._inject_extra_stream_providers = _safe_noop_extra_stream_provider_injection
+
+
+async def safe_get_episodes_by_mal_slug(mal_id: int):
+    """Fast MAL episode route without AnimeKai/AniZone injection."""
+    backup = await _api._fetch_mal_backup_episode_data(mal_id)
+    if "response" in backup:
+        return backup["response"]
+
+    data = backup["data"]
+    data["malBackup"] = {
+        "used": True,
+        "malId": mal_id,
+        "source": backup["source"],
+        "anilistId": backup["anilistId"],
+    }
+    return _api._proxy_deep_images(_api._inject_mal_source_slugs(data, mal_id))
+
+
+async def safe_get_episodes_by_mal(malId: int):
+    return await safe_get_episodes_by_mal_slug(malId)
 
 
 async def safe_get_watch_sources(provider: str, anilist_id: str, category: str, slug: str):
     """Resolve only the selected provider for AniList routes.
 
-    Important: do not call _inject_extra_stream_providers here. A Hop/Bee/Bonk
+    Important: do not call extra provider injection here. A Hop/Bee/Bonk
     request should not fail just because AnimeKai is slow or unavailable.
     """
     if isinstance(anilist_id, str) and anilist_id.startswith("mal-"):
@@ -128,7 +155,7 @@ async def safe_get_watch_sources(provider: str, anilist_id: str, category: str, 
             if not anime_slug:
                 raise HTTPException(
                     status_code=404,
-                    detail={"message": "Anikai slug lookup failed", "anilistId": resolved_anilist_id},
+                    detail={"message": "AnimeKai slug lookup failed", "anilistId": resolved_anilist_id},
                 )
             target_id = f"animekai:{anime_slug}:{episode_number}"
             return await _api.get_sources(
@@ -175,7 +202,7 @@ async def safe_get_watch_sources_by_mal(malId: int, provider: str, category: str
             if not anime_slug:
                 raise HTTPException(
                     status_code=404,
-                    detail={"message": "Anikai slug lookup failed", "anilistId": anilist_id, "malId": malId},
+                    detail={"message": "AnimeKai slug lookup failed", "anilistId": anilist_id, "malId": malId},
                 )
             target_id = f"animekai:{anime_slug}:{episode_number}"
             return await _api.get_sources(
@@ -218,11 +245,23 @@ def _remove_route(path: str, method: str = "GET") -> None:
     ]
 
 
-# Replace the original provider routes with safe versions.
+# Replace original routes with safe versions.
+_remove_route("/episodes/mal-{mal_id}")
+_remove_route("/episodes-by-mal/{malId}")
 _remove_route("/watch/{provider}/{anilist_id}/{category}/{slug:path}")
 _remove_route("/watch-by-mal/{malId}/{provider}/{category}/{episodeId:path}")
 _remove_route("/anizone/mal/{mal_id}/{ep_num}")
 
+app.add_api_route(
+    "/episodes/mal-{mal_id}",
+    safe_get_episodes_by_mal_slug,
+    methods=["GET"],
+)
+app.add_api_route(
+    "/episodes-by-mal/{malId}",
+    safe_get_episodes_by_mal,
+    methods=["GET"],
+)
 app.add_api_route(
     "/watch/{provider}/{anilist_id}/{category}/{slug:path}",
     safe_get_watch_sources,
@@ -239,4 +278,4 @@ app.add_api_route(
     methods=["GET"],
 )
 
-print("[API PATCH] Safe watch routes, AnimeKai timeout handling, and AniZone MAL route enabled.")
+print("[API PATCH] Safe watch routes, fast MAL episodes, AnimeKai timeout handling, and AniZone MAL route enabled.")
