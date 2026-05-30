@@ -2,7 +2,6 @@ import asyncio, base64, json, gzip, httpx, os, re, time
 from copy import deepcopy
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
-from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Any, Callable
 from dotenv import load_dotenv
@@ -194,13 +193,12 @@ from anizone_unified import (
     ANIZONE_BASE,
     _fetch as _anizone_fetch,
     _parse_search as _anizone_parse_search,
-    _parse_info as _anizone_parse_info,
     _parse_episode as _anizone_parse_episode,
     _parse_total_pages as _anizone_parse_total_pages,
     _parse_episode_cards as _anizone_parse_episode_cards,
     _parse_episodes_from_scripts as _anizone_parse_episodes_from_scripts,
-    _parse_mal_id as _anizone_parse_mal_id,
 )
+
 app.include_router(anizone_router)
 
 def _has_valid_api_key(request: Request) -> bool:
@@ -3291,15 +3289,14 @@ async def _fetch_anilist_episode_count(anilist_id: int) -> Optional[int]:
 
 
 async def _anizone_lookup_slug(anilist_id: int, title_candidates: Optional[list[str]] = None) -> Optional[str]:
-    """Resolve AniList ID to anizone slug using MAL ID cross-verification.
-    Falls back to title scoring when MAL is unavailable.
-    Cache: 24h on success, 15min on failure."""
+    """Resolve AniList ID to anizone slug via title search.
+    Uses AniList title → AniZone search → score matching.
+    No per-result page fetches. Cache: 24h on success, 15min on failure."""
     cache_key = f"anizone_slug:{anilist_id}"
     cached = _get_cache("anizone_lookup", cache_key)
     if cached is not None:
         if cached is _ANIZONE_SLUG_FAILURE:
             return None
-        print(f"[ANIZONE CACHE] Slug hit for {anilist_id}: {cached}")
         return cached
 
     lock = _anizone_stampede_lock(f"slug:{anilist_id}")
@@ -3311,8 +3308,6 @@ async def _anizone_lookup_slug(anilist_id: int, title_candidates: Optional[list[
             return cached
 
         t0 = time.time()
-        mal_id = _get_local_mal_id_for_anilist(anilist_id) or await _resolve_anilist_to_mal_with_anizip(anilist_id)
-
         titles = list(title_candidates or [])
         if not titles:
             titles = await _animekai_title_candidates(anilist_id)
@@ -3323,71 +3318,32 @@ async def _anizone_lookup_slug(anilist_id: int, title_candidates: Optional[list[
                 seen_lower.add(t.lower())
                 unique_titles.append(t)
 
-        if mal_id:
-            seen_slugs = set()
-            for title in unique_titles:
-                try:
-                    html = await run_in_threadpool(_anizone_fetch, f"{ANIZONE_BASE}/anime", f"{ANIZONE_BASE}/", {"search": title, "page": "1"}, 8.0)
-                except Exception:
-                    continue
-                for r in _anizone_parse_search(html):
-                    slug = r["slug"]
-                    if slug in seen_slugs:
-                        continue
-                    seen_slugs.add(slug)
-                    try:
-                        page_html = await run_in_threadpool(_anizone_fetch, f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime", {}, 8.0)
-                        if _anizone_parse_mal_id(page_html) == mal_id:
-                            _set_cache("anizone_lookup", cache_key, slug, ttl_hours=24)
-                            print(f"[ANIZONE FETCH] Slug {slug} for {anilist_id} (MAL {mal_id}) in {time.time()-t0:.2f}s")
-                            return slug
-                    except Exception:
-                        continue
-
-        best_slug = None
-        best_score = 0
         for title in unique_titles:
-            if not title:
-                continue
             try:
-                html = await run_in_threadpool(_anizone_fetch, f"{ANIZONE_BASE}/anime", f"{ANIZONE_BASE}/", {"search": title, "page": "1"}, 8.0)
+                html = await _anizone_fetch(f"{ANIZONE_BASE}/anime", f"{ANIZONE_BASE}/", {"search": title, "page": "1"}, 8.0)
             except Exception:
                 continue
             results = _anizone_parse_search(html)
             title_lower = title.lower()
+
+            # Exact match → return immediately
+            for r in results:
+                if r.get("title", "").lower() == title_lower:
+                    _set_cache("anizone_lookup", cache_key, r["slug"], ttl_hours=24)
+                    print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (exact) in {time.time()-t0:.2f}s")
+                    return r["slug"]
+
+            # Substring match (one-direction containment)
             for r in results:
                 rt = r.get("title", "").lower()
-                if not rt:
-                    continue
-                score = 0
-                if rt == title_lower:
-                    score = 5
-                elif rt.startswith(title_lower) or title_lower.startswith(rt):
-                    score = 4
-                else:
-                    title_words = set(title_lower.split())
-                    rt_words = set(rt.split())
-                    common = title_words & rt_words
-                    if common == title_words or common == rt_words:
-                        score = 3
-                    elif title_lower in rt or rt in title_lower:
-                        score = 2
-                        if min(len(rt), len(title_lower)) * 2 < max(len(rt), len(title_lower)):
-                            score = 1
-                if score > best_score:
-                    best_score = score
-                    best_slug = r["slug"]
-                    if score >= 5:
-                        _set_cache("anizone_lookup", cache_key, best_slug, ttl_hours=24)
-                        print(f"[ANIZONE FETCH] Slug {best_slug} for {anilist_id} (score=5) in {time.time()-t0:.2f}s")
-                        return best_slug
-        if best_slug:
-            _set_cache("anizone_lookup", cache_key, best_slug, ttl_hours=24)
-            print(f"[ANIZONE FETCH] Slug {best_slug} for {anilist_id} (score={best_score}) in {time.time()-t0:.2f}s")
-        else:
-            _set_cache("anizone_lookup", cache_key, _ANIZONE_SLUG_FAILURE, ttl_hours=0.25)
-            print(f"[ANIZONE SLUG MISS] No slug for anilist_id={anilist_id} in {time.time()-t0:.2f}s")
-        return best_slug
+                if rt and (title_lower in rt or rt in title_lower):
+                    _set_cache("anizone_lookup", cache_key, r["slug"], ttl_hours=24)
+                    print(f"[ANIZONE FETCH] Slug {r['slug']} for {anilist_id} (contains) in {time.time()-t0:.2f}s")
+                    return r["slug"]
+
+        _set_cache("anizone_lookup", cache_key, _ANIZONE_SLUG_FAILURE, ttl_hours=0.25)
+        print(f"[ANIZONE SLUG MISS] No slug for anilist_id={anilist_id} in {time.time()-t0:.2f}s")
+        return None
 
 
 async def _anizone_build_provider(anilist_id: int, title_candidates: Optional[list[str]] = None) -> Optional[dict]:
@@ -3400,7 +3356,7 @@ async def _anizone_build_provider(anilist_id: int, title_candidates: Optional[li
     if not slug:
         return None
     try:
-        html = await run_in_threadpool(_anizone_fetch, f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime")
+        html = await _anizone_fetch(f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime")
         total_pages = _anizone_parse_total_pages(html)
         seen_nums = set()
         all_episodes = []
@@ -3409,8 +3365,8 @@ async def _anizone_build_provider(anilist_id: int, title_candidates: Optional[li
         _anizone_parse_episodes_from_scripts(soup, slug, all_episodes, seen_nums)
         for page in range(2, total_pages + 1):
             try:
-                page_html = await run_in_threadpool(
-                    _anizone_fetch, f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime",
+                page_html = await _anizone_fetch(
+                    f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime",
                     {"page": str(page)},
                 )
                 page_soup = BeautifulSoup(page_html, "html.parser")
@@ -3497,7 +3453,7 @@ async def _anizone_fetch_and_cache_episode(cache_key: str, slug: str, ep_num: st
     t0 = time.time()
     referer = f"{ANIZONE_BASE}/anime/{slug}/{ep_num}"
     try:
-        html = await run_in_threadpool(_anizone_fetch, referer, f"{ANIZONE_BASE}/anime/{slug}", {}, 12.0)
+        html = await _anizone_fetch(referer, f"{ANIZONE_BASE}/anime/{slug}", {}, 12.0)
     except Exception as exc:
         print(f"[ANIZONE FETCH ERROR] {slug} ep={ep_num}: {exc}")
         return {"streams": [], "subtitles": [], "provider": "anizone", "error": str(exc)}

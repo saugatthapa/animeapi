@@ -1,6 +1,7 @@
 """
 AniZone Unified — Native scrapers + CDN proxy, no AniList.
 Designed to be mounted alongside the Miruro API.
+Uses persistent httpx.AsyncClient for fast connection reuse + HTTP/2.
 """
 
 import re
@@ -8,7 +9,6 @@ import json
 from typing import Optional
 import httpx
 from fastapi import HTTPException, Query, APIRouter
-from starlette.concurrency import run_in_threadpool
 from bs4 import BeautifulSoup
 
 ANIZONE_BASE = "https://anizone.to"
@@ -17,14 +17,28 @@ ANIZONE_HEADERS = {"User-Agent": ANIZONE_UA, "Accept": "text/html, */*", "Accept
 
 router = APIRouter(prefix="/anizone", tags=["AniZone"])
 
+_client: httpx.AsyncClient | None = None
 
-def _fetch(url: str, referer: str = "", params: dict | None = None, timeout: float = 30.0) -> str:
+
+async def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            http2=True,
+            timeout=httpx.Timeout(30.0),
+            headers=ANIZONE_HEADERS,
+            follow_redirects=True,
+        )
+    return _client
+
+
+async def _fetch(url: str, referer: str = "", params: dict | None = None, timeout: float = 30.0) -> str:
+    client = await _get_client()
     headers = dict(ANIZONE_HEADERS)
     if referer:
         headers["Referer"] = referer
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as c:
-            r = c.get(url, headers=headers, params=params or {})
+        r = await client.get(url, headers=headers, params=params or {}, timeout=timeout)
     except Exception as e:
         raise HTTPException(502, f"Fetch failed: {e}")
     if r.status_code == 403 and "cdn-cgi" in r.text:
@@ -101,7 +115,6 @@ def _parse_episodes_from_scripts(soup, slug, episodes: list, seen_nums: set):
     """Fallback: extract episode numbers from embedded JSON/JS in script tags."""
     for script in soup.select("script"):
         text = script.string or ""
-        # Look for Livewire initial-data attribute JSON
         for el in soup.select("[wire\\:initial-data]"):
             raw = el.get("wire:initial-data", "")
             if not raw:
@@ -126,7 +139,6 @@ def _parse_episodes_from_scripts(soup, slug, episodes: list, seen_nums: set):
                                     episodes.append({"number": num, "title": v.get("title", f"Episode {num}"), "image": v.get("image", "") or v.get("poster", "")})
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
-        # Look for JSON arrays in script content
         for m in re.finditer(r'(?:episodes|episodeList|data)\s*[:=]\s*(\[[\s\S]*?\])\s*[;,]', text):
             try:
                 items = json.loads(m.group(1))
@@ -241,7 +253,7 @@ def _parse_episode(html: str) -> dict:
 @router.get("/search")
 async def search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
     try:
-        html = await run_in_threadpool(_fetch, f"{ANIZONE_BASE}/anime", f"{ANIZONE_BASE}/", {"search": q, "page": str(page)})
+        html = await _fetch(f"{ANIZONE_BASE}/anime", f"{ANIZONE_BASE}/", {"search": q, "page": str(page)})
     except HTTPException as e:
         return {"error": str(e.detail), "results": []}
     results = _parse_search(html)
@@ -252,7 +264,7 @@ async def search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
 async def info(slug: str):
     slug = slug.strip().split("/")[0]
     try:
-        html = await run_in_threadpool(_fetch, f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime")
+        html = await _fetch(f"{ANIZONE_BASE}/anime/{slug}", f"{ANIZONE_BASE}/anime")
     except HTTPException as e:
         raise HTTPException(e.status_code, detail=f"Failed: {e.detail}")
     return _parse_info(html, slug)
@@ -262,7 +274,7 @@ async def info(slug: str):
 async def episode(slug: str, episode_num: int):
     slug = slug.strip().split("/")[0]
     try:
-        html = await run_in_threadpool(_fetch, f"{ANIZONE_BASE}/anime/{slug}/{episode_num}", f"{ANIZONE_BASE}/anime/{slug}")
+        html = await _fetch(f"{ANIZONE_BASE}/anime/{slug}/{episode_num}", f"{ANIZONE_BASE}/anime/{slug}")
     except HTTPException as e:
         raise HTTPException(e.status_code, detail=f"Failed: {e.detail}")
     data = _parse_episode(html)
@@ -274,7 +286,7 @@ async def episode(slug: str, episode_num: int):
 @router.get("/popular")
 async def popular(page: int = Query(1, ge=1)):
     try:
-        html = await run_in_threadpool(_fetch, f"{ANIZONE_BASE}/anime?page={page}", f"{ANIZONE_BASE}/")
+        html = await _fetch(f"{ANIZONE_BASE}/anime?page={page}", f"{ANIZONE_BASE}/")
     except HTTPException as e:
         return {"error": str(e.detail), "results": []}
     results = _parse_search(html)
@@ -288,9 +300,9 @@ async def cdn_proxy(path: str):
     from fastapi.responses import Response
     url = f"https://{path}"
     headers = {"User-Agent": ANIZONE_UA, "Origin": ANIZONE_BASE, "Referer": f"{ANIZONE_BASE}/"}
+    client = await _get_client()
     try:
-        with httpx.Client(timeout=30.0, follow_redirects=True) as c:
-            r = c.get(url, headers=headers)
+        r = await client.get(url, headers=headers)
     except Exception as e:
         raise HTTPException(500, str(e))
     if r.status_code != 200:
