@@ -161,6 +161,10 @@ async def safe_get_watch_sources(provider: str, anilist_id: str, category: str, 
                 category=category,
             )
 
+        if _api._is_mkissa_provider(provider):
+            episode_number = slug.strip().lstrip("0") or "1"
+            return await _api.get_sources(episodeId=episode_number, provider="mkissa", anilistId=resolved_anilist_id, category=category)
+
         data = await _api._fetch_raw_episodes(resolved_anilist_id)
         target_id = _api._resolve_slug_to_episode_id(data, provider, category, slug)
         if not target_id:
@@ -207,6 +211,10 @@ async def safe_get_watch_sources_by_mal(malId: int, provider: str, category: str
                 anilistId=anilist_id,
                 category=category,
             )
+
+        if _api._is_mkissa_provider(provider):
+            episode_number = episodeId.strip().lstrip("0") or "1"
+            return await _api.get_sources(episodeId=episode_number, provider="mkissa", anilistId=anilist_id, category=category)
 
         data = await _api._fetch_raw_episodes(anilist_id)
         target_id = _api._resolve_slug_to_episode_id(data, provider, category, episodeId)

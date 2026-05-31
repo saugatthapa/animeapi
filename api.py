@@ -254,6 +254,15 @@ MIRURO_PIPE_URL = "https://www.miruro.tv/api/secure/pipe"
 ANIZIP_URL = "https://api.ani.zip/mappings"
 STREAM_PROXY_URL = os.getenv("STREAM_PROXY_URL", "http://panel.thapasir.qzz.io:16261").rstrip("/")
 STREAM_PROXY_ORDER = ["animekai", "animanga", "anikuro", "lunaranime", "miruro"]
+ENABLE_STREAM_PROXY = os.getenv("ENABLE_STREAM_PROXY", "0").strip().lower() in {"1", "true", "yes"}
+ENABLE_SUBTITLE_FALLBACKS = os.getenv("ENABLE_SUBTITLE_FALLBACKS", "0").strip().lower() in {"1", "true", "yes"}
+STREAM_PROXY_TIMEOUT_SECONDS = float(os.getenv("STREAM_PROXY_TIMEOUT_SECONDS", "2.5"))
+SUBTITLE_FALLBACK_TIMEOUT_SECONDS = float(os.getenv("SUBTITLE_FALLBACK_TIMEOUT_SECONDS", "4"))
+DISABLED_STREAM_PROVIDERS = {
+    item.strip().lower()
+    for item in os.getenv("DISABLED_STREAM_PROVIDERS", "kiwi").split(",")
+    if item.strip()
+}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPINGS_PATH = os.path.join(BASE_DIR, "mappings.json")
 MANGA_MAPPINGS_PATH = os.path.join(BASE_DIR, "manga_mappings.json")
@@ -556,6 +565,24 @@ def _proxy_deep_images(obj):
     # Proxy removed — return data unchanged
     return obj
 
+
+def _is_disabled_stream_provider(provider_name: str) -> bool:
+    return (provider_name or "").strip().lower() in DISABLED_STREAM_PROVIDERS
+
+
+def _remove_disabled_stream_providers(data: dict) -> dict:
+    if not isinstance(data, dict) or not DISABLED_STREAM_PROVIDERS:
+        return data
+
+    providers = data.get("providers")
+    if isinstance(providers, dict):
+        for provider_name in list(providers.keys()):
+            if _is_disabled_stream_provider(provider_name):
+                providers.pop(provider_name, None)
+
+    return data
+
+
 def _episode_slug_prefix(provider_name: str, episode_id, episode_number) -> str:
     """Extract a stable provider slug without reusing already-wrapped watch routes."""
     if _is_animekai_provider(provider_name):
@@ -577,6 +604,7 @@ def _episode_slug_prefix(provider_name: str, episode_id, episode_number) -> str:
 
 def _inject_source_slugs(data: dict, anilist_id: int):
     """Transform episode IDs into simplified path-based slugs: watch/PROV/ALID/CAT/PREFIX-NUMBER"""
+    data = _remove_disabled_stream_providers(data)
     providers = data.get("providers", {})
     for provider_name, provider_data in providers.items():
         if not isinstance(provider_data, dict):
@@ -604,6 +632,7 @@ def _inject_source_slugs(data: dict, anilist_id: int):
 
 def _inject_mal_source_slugs(data: dict, mal_id: int):
     """Transform episode IDs into MAL-backup slugs: watch-by-mal/MALID/PROV/CAT/PREFIX-NUMBER"""
+    data = _remove_disabled_stream_providers(data)
     providers = data.get("providers", {})
     for provider_name, provider_data in providers.items():
         if not isinstance(provider_data, dict):
@@ -786,6 +815,20 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
 
 
 async def _fetch_raw_sources(episode_id: str, provider: str, category: str, anime_query: dict) -> dict:
+    cache_key = json.dumps(
+        {
+            "episodeId": episode_id,
+            "provider": provider,
+            "category": category,
+            "animeQuery": anime_query,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    cached = _get_cache("miruro_sources", cache_key)
+    if cached is not None:
+        return deepcopy(cached)
+
     enc_id = base64.urlsafe_b64encode(episode_id.encode()).decode().rstrip('=')
     query = {
         "episodeId": enc_id,
@@ -793,7 +836,9 @@ async def _fetch_raw_sources(episode_id: str, provider: str, category: str, anim
         "category": category,
     }
     query.update(anime_query)
-    return await _fetch_pipe("sources", query, translate_ids=False)
+    data = await _fetch_pipe("sources", query, translate_ids=False)
+    _set_cache("miruro_sources", cache_key, deepcopy(data), ttl_hours=0.25)
+    return data
 
 
 async def _try_episode_fetch(query: dict):
@@ -855,7 +900,7 @@ async def _fetch_mal_backup_episode_data(mal_id: int):
 
 async def _fetch_stream_proxy_candidates(stream_url: str, referer: str):
     """Generate external proxy fallback URLs for a stream URL + referer pair."""
-    if not STREAM_PROXY_URL or not stream_url or not referer:
+    if not ENABLE_STREAM_PROXY or not STREAM_PROXY_URL or not stream_url or not referer:
         return None
 
     cache_key = f"{stream_url}|{referer}"
@@ -864,7 +909,7 @@ async def _fetch_stream_proxy_candidates(stream_url: str, referer: str):
         return cached
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=STREAM_PROXY_TIMEOUT_SECONDS) as client:
             res = await client.get(
                 f"{STREAM_PROXY_URL}/proxy",
                 params={"data": f"{stream_url}|{referer}"},
@@ -897,16 +942,19 @@ async def _fetch_stream_proxy_candidates(stream_url: str, referer: str):
 async def _attach_stream_proxy_candidates_to_streams(streams):
     if not isinstance(streams, list) or not streams:
         return
-    for stream in streams:
+
+    async def attach_one(stream):
         if not isinstance(stream, dict):
-            continue
+            return
         stream_url = stream.get("url")
         referer = stream.get("referer")
         if not stream_url or not referer:
-            continue
+            return
         proxy_data = await _fetch_stream_proxy_candidates(stream_url, referer)
         if proxy_data:
             stream["proxy"] = proxy_data
+
+    await asyncio.gather(*(attach_one(stream) for stream in streams))
 
 
 def _normalize_payload_subtitles_recursive(payload):
@@ -1131,6 +1179,17 @@ def _apply_subtitle_mode_hints(payload: dict, category: str) -> dict:
         payload["subtitleMode"] = "manual"
         payload["defaultSubtitle"] = -1
 
+    # Ensure branch structure for sub/dub routing
+    branch_key = {"sub": "ssub", "dub": "sdub"}.get(category.lower())
+    if branch_key:
+        top_streams = payload.get("streams")
+        existing_branch = payload.get(branch_key)
+        if isinstance(top_streams, list) and len(top_streams) > 0:
+            if not isinstance(existing_branch, dict):
+                payload[branch_key] = {"streams": top_streams, "subtitles": payload.get("subtitles", [])}
+            elif not isinstance(existing_branch.get("streams"), list) or len(existing_branch.get("streams", [])) == 0:
+                existing_branch["streams"] = top_streams
+
     return payload
 
 
@@ -1274,6 +1333,40 @@ async def _attach_provider_subtitle_fallbacks(
         payload.pop("subtitleFallbackProvider", None)
         payload.pop("subtitleFallbackProviders", None)
 
+    return _apply_subtitle_mode_hints(payload, category)
+
+
+async def _prepare_source_payload(
+    payload: dict,
+    *,
+    provider: str,
+    category: str,
+    episode_id: str,
+    anilist_id: int,
+    anime_query: dict,
+) -> dict:
+    """Keep playback fast by making optional enrichments non-blocking by default."""
+    payload = await _attach_stream_proxy_candidates(payload)
+
+    if not ENABLE_SUBTITLE_FALLBACKS:
+        return _apply_subtitle_mode_hints(payload, category)
+
+    try:
+        return await asyncio.wait_for(
+            _attach_provider_subtitle_fallbacks(
+                payload,
+                provider=provider,
+                category=category,
+                episode_id=episode_id,
+                anilist_id=anilist_id,
+                anime_query=anime_query,
+            ),
+            timeout=SUBTITLE_FALLBACK_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        print(f"[SUBTITLE FALLBACK TIMEOUT] {provider}/{episode_id}")
+    except Exception as exc:
+        print(f"[SUBTITLE FALLBACK WARN] {provider}/{episode_id}: {exc}")
     return _apply_subtitle_mode_hints(payload, category)
 
 
@@ -3390,6 +3483,137 @@ async def _animekai_resolve_embed(url: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# MKissa provider (allanime / mkissa.to)
+# ---------------------------------------------------------------------------
+
+MKISSA_BASE = "https://mkissa.to"
+MKISSA_API = "https://api.allanime.day/api"
+MKISSA_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+MKISSA_HEADERS = {"User-Agent": MKISSA_UA, "Content-Type": "application/json", "Accept": "application/json"}
+
+MKISSA_SEARCH_QUERY = """
+query($search: SearchInput, $limit: Int, $page: Int, $translationType: VaildTranslationTypeEnumType) {
+  shows(search: $search, limit: $limit, page: $page, translationType: $translationType) {
+    edges { _id name englishName nativeName slugTime thumbnail }
+  }
+}
+"""
+
+MKISSA_EPISODE_QUERY = """
+query($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) {
+  episode(showId: $showId, translationType: $translationType, episodeString: $episodeString) {
+    episodeString sourceUrls notes
+  }
+}
+"""
+
+
+def _is_mkissa_provider(provider: str) -> bool:
+    return (provider or "").lower() in {"mkissa", "allanime", "allmanga", "anime"}
+
+
+async def _mkissa_graphql(query: str, variables: dict) -> dict:
+    headers = {**MKISSA_HEADERS, "Origin": MKISSA_BASE, "Referer": f"{MKISSA_BASE}/anime"}
+    async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(30.0), follow_redirects=True) as cl:
+        r = await cl.post(MKISSA_API, json={"query": query, "variables": variables}, headers=headers)
+        if r.status_code != 200:
+            raise HTTPException(502, f"MKissa API error: {r.status_code}")
+        body = r.json()
+        if "errors" in body:
+            raise HTTPException(502, f"MKissa API error: {body['errors']}")
+        return body["data"]
+
+
+async def _mkissa_search_by_title(title: str, translation_type: str = "sub") -> dict:
+    data = await _mkissa_graphql(MKISSA_SEARCH_QUERY, {
+        "search": {"sortBy": "Trending", "query": title},
+        "limit": 10,
+        "page": 1,
+        "translationType": translation_type,
+    })
+    shows = data.get("shows") or {}
+    edges = shows.get("edges") or []
+    for edge in edges:
+        name = (edge.get("englishName") or edge.get("name") or "").lower()
+        if title.lower() in name or name in title.lower():
+            return edge
+    if edges:
+        return edges[0]
+    return None
+
+
+async def _mkissa_sources(show_id: str, episode_num: str, translation_type: str = "sub") -> dict:
+    try:
+        data = await _mkissa_graphql(MKISSA_EPISODE_QUERY, {
+            "showId": show_id,
+            "translationType": translation_type,
+            "episodeString": episode_num,
+        })
+    except HTTPException:
+        return {"streams": [], "subtitles": [], "error": "Episode not found on MKissa"}
+    ep = data.get("episode")
+    if not ep:
+        return {"streams": [], "subtitles": [], "error": "Episode not found on MKissa"}
+    sources = []
+    raw = ep.get("sourceUrls")
+    if isinstance(raw, list):
+        for src in raw:
+            if isinstance(src, dict):
+                url = (src.get("sourceUrl") or "").strip()
+                if url:
+                    sources.append({"url": url, "type": "hls" if ".m3u8" in url else "mp4"})
+            elif isinstance(src, str):
+                url = src.strip()
+                if url:
+                    sources.append({"url": url, "type": "hls" if ".m3u8" in url else "mp4"})
+    elif isinstance(raw, str):
+        import json as _json
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, list):
+                for src in parsed:
+                    if isinstance(src, dict):
+                        url = (src.get("sourceUrl") or src.get("url") or "").strip()
+                        if url:
+                            sources.append({"url": url, "type": "hls" if ".m3u8" in url else "mp4"})
+        except (_json.JSONDecodeError, TypeError):
+            url = raw.strip()
+            if url:
+                sources.append({"url": url, "type": "hls" if ".m3u8" in url else "mp4"})
+    return {
+        "streams": sources,
+        "subtitles": [],
+        "headers": {"Referer": f"{MKISSA_BASE}/", "User-Agent": MKISSA_UA},
+    }
+
+
+async def _mkissa_sources_from_episode_id(episode_id: str, category: str, anilist_id: int) -> dict:
+    parts = episode_id.split(":", 2)
+    if len(parts) == 3 and parts[0] == "mkissa":
+        show_id = parts[1]
+        episode_num = parts[2]
+        return await _mkissa_sources(show_id, episode_num, category)
+    episode_num = episode_id.strip().lstrip("0") or "1"
+    title = ""
+    try:
+        gql = f"""query {{ Media(id: {anilist_id}) {{ title {{ english romaji native }} }} }}"""
+        info = await _anilist_query(gql)
+        media = info.get("Media", {}) or info.get("data", {}).get("Media", {})
+        title = (media.get("title", {}).get("english") or media.get("title", {}).get("romaji") or media.get("title", {}).get("native") or "")
+    except Exception:
+        pass
+    if not title:
+        return {"streams": [], "subtitles": [], "error": "Cannot resolve title for MKissa search"}
+    found = await _mkissa_search_by_title(title, category)
+    if not found:
+        return {"streams": [], "subtitles": [], "error": "Show not found on MKissa"}
+    show_id = found.get("_id") or found.get("slugTime") or ""
+    if not show_id:
+        return {"streams": [], "subtitles": [], "error": "MKissa show ID not found"}
+    return await _mkissa_sources(show_id, episode_num, category)
+
+
 @app.get("/animekai/search", include_in_schema=False)
 async def animekai_search(q: str = Query(..., min_length=1, description="Anime search query")):
     soup = await _animekai_fetch_soup(f"/browser?keyword={quote(q)}")
@@ -4089,7 +4313,7 @@ async def get_episodes_by_mal_slug(mal_id: int):
         "source": backup["source"],
         "anilistId": backup["anilistId"],
     }
-    return _proxy_deep_images(_inject_mal_source_slugs(data, mal_id))
+    return _proxy_deep_images(_remove_disabled_stream_providers(_inject_mal_source_slugs(data, mal_id)))
 
 
 @app.get("/episodes/{anilist_id}")
@@ -4123,7 +4347,8 @@ async def get_episodes(
         }
         return _proxy_deep_images(_inject_mal_source_slugs(data, malId))
 
-    return await _cached_response("episodes", 43200, fetch_fn, str(anilist_id))
+    data = await _cached_response("episodes", 43200, fetch_fn, str(anilist_id))
+    return _remove_disabled_stream_providers(data)
 
 
 @app.get("/episodes-by-mal/{malId}")
@@ -4140,12 +4365,26 @@ async def get_sources(
     category: str = Query("sub", description="sub or dub"),
 ):
     """Get M3U8 streaming sources for a specific episode."""
+    if _is_disabled_stream_provider(provider):
+        raise HTTPException(status_code=410, detail=f"Provider '{provider}' is disabled")
+
     if _is_animekai_provider(provider):
         data = await _animekai_sources_from_episode_id(episodeId, category)
-        data = await _attach_stream_proxy_candidates(data)
-        data = await _attach_provider_subtitle_fallbacks(
+        data = await _prepare_source_payload(
             data,
             provider="animekai",
+            category=category,
+            episode_id=episodeId,
+            anilist_id=anilistId,
+            anime_query={"anilistId": anilistId},
+        )
+        return _proxy_deep_images(data)
+
+    if _is_mkissa_provider(provider):
+        data = await _mkissa_sources_from_episode_id(episodeId, category, anilistId)
+        data = await _prepare_source_payload(
+            data,
+            provider="mkissa",
             category=category,
             episode_id=episodeId,
             anilist_id=anilistId,
@@ -4159,8 +4398,7 @@ async def get_sources(
         category=category,
         anime_query={"anilistId": anilistId},
     )
-    data = await _attach_stream_proxy_candidates(data)
-    data = await _attach_provider_subtitle_fallbacks(
+    data = await _prepare_source_payload(
         data,
         provider=provider,
         category=category,
@@ -4200,6 +4438,10 @@ async def get_watch_sources(provider: str, anilist_id: str, category: str, slug:
         target_id = f"animekai:{anime_slug}:{episode_number}"
         return await get_sources(episodeId=target_id, provider="animekai", anilistId=resolved_anilist_id, category=category)
 
+    if _is_mkissa_provider(provider):
+        episode_number = slug.strip().lstrip("0") or "1"
+        return await get_sources(episodeId=episode_number, provider="mkissa", anilistId=resolved_anilist_id, category=category)
+
     data = await _fetch_raw_episodes(resolved_anilist_id)
     target_id = _resolve_slug_to_episode_id(data, provider, category, slug)
 
@@ -4237,6 +4479,10 @@ async def get_watch_sources_by_mal(malId: int, provider: str, category: str, epi
             )
         target_id = f"animekai:{anime_slug}:{episode_number}"
         return await get_sources(episodeId=target_id, provider="animekai", anilistId=anilist_id, category=category)
+
+    if _is_mkissa_provider(provider):
+        episode_number = episodeId.strip().lstrip("0") or "1"
+        return await get_sources(episodeId=episode_number, provider="mkissa", anilistId=anilist_id, category=category)
 
     data = await _fetch_raw_episodes(anilist_id)
     target_id = _resolve_slug_to_episode_id(data, provider, category, episodeId)
@@ -4286,6 +4532,3 @@ async def health_redis():
             "error": str(e),
             "response_time_ms": round((time.time() - t0) * 1000),
         }
-
-
-
