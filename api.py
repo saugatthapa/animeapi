@@ -628,6 +628,65 @@ def _anizone_watch_id(anilist_id: int, category: str, episode_url: str) -> str:
     return f"watch/anizone/{anilist_id}/{category}/{encode_anizone_url(episode_url)}"
 
 
+def _merge_anizone_and_miruro_episodes(anilist_id: int, anizone_data: Optional[dict], miruro_data: Optional[dict], warnings: Optional[list[str]] = None) -> dict:
+    warnings = warnings or []
+    result = {
+        "providers": {},
+        "episodes": {"sub": [], "dub": []},
+        "warnings": warnings,
+    }
+
+    # Add Anizone first
+    if isinstance(anizone_data, dict):
+        anizone_eps = []
+        eps = anizone_data.get("episodes")
+        if isinstance(eps, dict):
+            anizone_eps = eps.get("sub", []) if isinstance(eps.get("sub"), list) else []
+        if anizone_eps:
+            result["providers"]["anizone"] = {
+                "id": "anizone",
+                "name": "Anizone",
+                "episodes": {"sub": anizone_eps, "dub": anizone_eps},
+            }
+            result["episodes"]["sub"] = anizone_eps
+
+    # Add Miruro providers after Anizone
+    miruro_providers = miruro_data.get("providers", {}) if isinstance(miruro_data, dict) else {}
+    for provider_key, provider_data in miruro_providers.items():
+        if provider_key == "anizone":
+            continue
+        if not isinstance(provider_data, dict):
+            continue
+        episodes = provider_data.get("episodes")
+        if isinstance(episodes, list):
+            episodes = {"sub": episodes, "dub": []}
+        if not isinstance(episodes, dict):
+            continue
+        sub_eps = episodes.get("sub", []) if isinstance(episodes.get("sub"), list) else []
+        dub_eps = episodes.get("dub", []) if isinstance(episodes.get("dub"), list) else []
+        if not sub_eps and not dub_eps:
+            continue
+        result["providers"][provider_key] = {
+            **provider_data,
+            "id": provider_key,
+            "episodes": {"sub": sub_eps, "dub": dub_eps},
+        }
+
+    # If top-level episodes not set by Anizone, use first provider's episodes
+    if not result["episodes"]["sub"] and not result["episodes"]["dub"]:
+        for provider_data in result["providers"].values():
+            episodes = provider_data.get("episodes", {})
+            if not isinstance(episodes, dict):
+                continue
+            sub_eps = episodes.get("sub", []) if isinstance(episodes.get("sub"), list) else []
+            dub_eps = episodes.get("dub", []) if isinstance(episodes.get("dub"), list) else []
+            if sub_eps or dub_eps:
+                result["episodes"] = {"sub": sub_eps, "dub": dub_eps}
+                break
+
+    return result
+
+
 def _anizone_episode_response(anilist_id: int, episodes: list[dict]) -> dict:
     items = []
     for index, episode in enumerate(episodes or [], start=1):
@@ -4543,45 +4602,82 @@ async def get_episodes(
     anilist_id: int,
     malId: Optional[int] = Query(None, description="Optional MAL ID to use only if the AniList lookup fails"),
 ):
-    """Get the episode list for an anime, with MAL backup only after AniList fails."""
+    """Get the episode list merging Anizone + Miruro providers.
+    Returns 200 whenever at least one provider has episodes.
+    Never returns 500 — provider failures are collected as warnings.
+    """
     async def fetch_fn():
-        anizone_data = await _inject_anizone_provider({"providers": {}}, anilist_id)
-        has_anizone = bool(anizone_data.get("providers", {}).get("anizone"))
-        if has_anizone:
-            return _proxy_deep_images(_order_stream_providers(anizone_data))
+        warnings = []
+        anizone_data = None
+        miruro_data = None
 
-        data, error = await _try_episode_fetch({"anilistId": anilist_id})
-        if data is not None:
-            data = await _inject_anizone_provider(data, anilist_id)
-            return _proxy_deep_images(_order_stream_providers(_inject_source_slugs(data, anilist_id)))
-
+        # 1. Fetch Anizone episodes (soft fail)
         try:
-            animekai_only = await _animekai_only_episode_payload(anilist_id)
+            anizone_data = await _inject_anizone_provider({"providers": {}}, anilist_id)
         except Exception as exc:
-            print(f"[ANIMEKAI WARN] AnimeKai-only fallback failed for {anilist_id}: {exc}")
-            animekai_only = None
-        if animekai_only is not None:
-            animekai_only = await _inject_anizone_provider(animekai_only, anilist_id)
-            return _proxy_deep_images(_order_stream_providers(_inject_source_slugs(animekai_only, anilist_id)))
+            warnings.append(f"anizone lookup failed: {exc}")
 
-        if malId is None:
-            _raise_pipe_lookup_error(error, "AniList episode lookup failed")
+        # 2. Fetch Miruro pipe for backup providers (soft fail, always)
+        try:
+            raw_miruro, miruro_error = await _try_episode_fetch({"anilistId": anilist_id})
+            if raw_miruro is not None:
+                miruro_data = _inject_source_slugs(raw_miruro, anilist_id)
+        except Exception as exc:
+            warnings.append(f"miruro episode fetch failed: {exc}")
 
-        backup = await _fetch_mal_backup_episode_data(malId)
-        if "response" in backup:
-            return backup["response"]
+        # 3. Merge Anizone + Miruro providers
+        result = _merge_anizone_and_miruro_episodes(anilist_id, anizone_data, miruro_data, warnings)
 
-        data = backup["data"]
-        data["malBackup"] = {
-            "used": True,
-            "malId": malId,
-            "source": backup["source"],
-            "anilistId": backup["anilistId"],
-        }
-        data = await _inject_anizone_provider(data, backup["anilistId"])
-        return _proxy_deep_images(_order_stream_providers(_inject_mal_source_slugs(data, malId)))
+        # 4. If no providers from either source, try AnimeKai + MAL fallbacks
+        has_any_providers = bool(result.get("providers"))
+        if not has_any_providers:
+            try:
+                animekai_only = await _animekai_only_episode_payload(anilist_id)
+            except Exception as exc:
+                warnings.append(f"animekai-only fallback failed: {exc}")
+                animekai_only = None
 
-    data = await _cached_response("episodes:v2", 43200, fetch_fn, str(anilist_id))
+            if animekai_only is not None:
+                try:
+                    animekai_only = await _inject_anizone_provider(animekai_only, anilist_id)
+                except Exception as exc:
+                    warnings.append(f"anizone inject into animekai failed: {exc}")
+                result = _merge_anizone_and_miruro_episodes(
+                    anilist_id,
+                    anizone_data,
+                    _inject_source_slugs(animekai_only, anilist_id),
+                    warnings,
+                )
+                has_any_providers = bool(result.get("providers"))
+
+        if not has_any_providers and malId is not None:
+            try:
+                backup = await _fetch_mal_backup_episode_data(malId)
+                if "response" in backup:
+                    resp = backup["response"]
+                    if warnings:
+                        resp["warnings"] = warnings
+                    return resp
+                data = backup["data"]
+                data["malBackup"] = {
+                    "used": True, "malId": malId,
+                    "source": backup["source"], "anilistId": backup["anilistId"],
+                }
+                result = _merge_anizone_and_miruro_episodes(
+                    anilist_id,
+                    anizone_data,
+                    _inject_mal_source_slugs(data, malId),
+                    warnings,
+                )
+            except Exception as exc:
+                warnings.append(f"mal backup failed: {exc}")
+
+        result = _order_stream_providers(result)
+        result = _proxy_deep_images(result)
+        result["warnings"] = warnings
+        return result
+
+    data = await _cached_response("episodes:v3", 43200, fetch_fn, str(anilist_id))
     return _order_stream_providers(_remove_disabled_stream_providers(data))
 
 
