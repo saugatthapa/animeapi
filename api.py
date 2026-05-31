@@ -203,7 +203,8 @@ def _has_valid_api_key(request: Request) -> bool:
 @app.middleware("http")
 async def secure_api(request: Request, call_next):
     PUBLIC_PATHS = {"/", "/docs", "/redoc", "/openapi.json"}
-    if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/health") or request.url.path.startswith("/anizone"):
+    if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/health") or request.url.path.startswith("/anizone") or request.url.path.startswith("/episodes") or request.url.path.startswith("/info"):
+        return await call_next(request)
         return await call_next(request)
 
     # Allow browser preflight OPTIONS requests without restrictions
