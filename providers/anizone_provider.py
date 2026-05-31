@@ -159,48 +159,67 @@ class AnizoneProvider:
 
     async def get_episodes(self, anime_url: str) -> list[dict]:
         normalized_url = normalize_anizone_url(anime_url)
-        soup = await asyncio.wait_for(
-            self._fetch_soup(normalized_url, ANIZONE_EPISODES_TIMEOUT_SECONDS),
-            timeout=ANIZONE_EPISODES_TIMEOUT_SECONDS + 1,
-        )
 
-        episodes = []
-        candidates = list(soup.select("ul.grid li a"))
-        if not candidates:
-            anime_path = urlparse(normalized_url).path.rstrip("/")
-            candidates = [
-                element
-                for element in soup.select("a[href]")
-                if urlparse(absolute_url(element.get("href") or "")).path.startswith(f"{anime_path}/")
-            ]
-
+        all_episodes = []
         seen_urls = set()
-        for index, element in enumerate(candidates, start=1):
-            href = element.get("href") or ""
-            if not href:
-                continue
-            source_id = absolute_url(href)
-            if source_id in seen_urls:
-                continue
-            seen_urls.add(source_id)
-            title = safe_text(element.select_one("h3")) or safe_text(element) or f"Episode {index}"
-            if "episode" not in title.lower():
-                title = f"Episode {extract_episode_number(source_id) or index}"
-            number = extract_episode_number(title) or str(index)
-            episodes.append(
-                {
-                    "id": encode_anizone_url(source_id),
-                    "provider": self.name,
-                    "animeId": normalized_url,
-                    "number": number,
-                    "title": title,
-                    "sourceId": source_id,
-                }
+        page = 1
+        max_pages = 10  # safety cap (10 * 36 = 360 episodes, covers most anime)
+
+        async def fetch_page(p: int) -> BeautifulSoup:
+            page_url = f"{normalized_url}?page={p}" if p > 1 else normalized_url
+            return await asyncio.wait_for(
+                self._fetch_soup(page_url, ANIZONE_EPISODES_TIMEOUT_SECONDS),
+                timeout=ANIZONE_EPISODES_TIMEOUT_SECONDS + 1,
             )
 
-        episodes.sort(key=_episode_sort_key)
-        print(f"[Anizone] episodes count={len(episodes)}")
-        return episodes
+        while page <= max_pages:
+            soup = await fetch_page(page)
+
+            candidates = list(soup.select("ul.grid li a"))
+            if not candidates:
+                anime_path = urlparse(normalized_url).path.rstrip("/")
+                candidates = [
+                    element
+                    for element in soup.select("a[href]")
+                    if urlparse(absolute_url(element.get("href") or "")).path.startswith(f"{anime_path}/")
+                ]
+
+            if not candidates:
+                break
+
+            page_has_new = False
+            for element in candidates:
+                href = element.get("href") or ""
+                if not href:
+                    continue
+                source_id = absolute_url(href)
+                if source_id in seen_urls:
+                    continue
+                page_has_new = True
+                seen_urls.add(source_id)
+                title = safe_text(element.select_one("h3")) or safe_text(element) or ""
+                if "episode" not in title.lower():
+                    title = f"Episode {extract_episode_number(source_id) or (len(all_episodes) + 1)}"
+                number = extract_episode_number(title) or str(len(all_episodes) + 1)
+                all_episodes.append(
+                    {
+                        "id": encode_anizone_url(source_id),
+                        "provider": self.name,
+                        "animeId": normalized_url,
+                        "number": number,
+                        "title": title,
+                        "sourceId": source_id,
+                    }
+                )
+
+            if not page_has_new:
+                break
+
+            page += 1
+
+        all_episodes.sort(key=_episode_sort_key)
+        print(f"[Anizone] episodes count={len(all_episodes)} pages={page}")
+        return all_episodes
 
     async def get_sources(self, episode_url: str) -> dict:
         normalized_url = normalize_anizone_url(episode_url)

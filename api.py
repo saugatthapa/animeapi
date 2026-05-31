@@ -4389,7 +4389,7 @@ async def _anizone_episodes_cached(anime_url: str) -> dict:
     async def fetch_fn():
         return {"episodes": await _anizone_provider.get_episodes(normalized_url)}
 
-    return await _cached_response("anizone_episodes", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, normalized_url)
+    return await _cached_response("anizone_episodes:v2", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, normalized_url)
 
 
 async def _anizone_sources_cached(episode_url: str) -> dict:
@@ -4581,7 +4581,7 @@ async def get_episodes(
         data = await _inject_anizone_provider(data, backup["anilistId"])
         return _proxy_deep_images(_order_stream_providers(_inject_mal_source_slugs(data, malId)))
 
-    data = await _cached_response("episodes", 43200, fetch_fn, str(anilist_id))
+    data = await _cached_response("episodes:v2", 43200, fetch_fn, str(anilist_id))
     return _order_stream_providers(_remove_disabled_stream_providers(data))
 
 
