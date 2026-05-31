@@ -1,1 +1,0 @@
-Fix dub infinite re-render loop in subtitle effect

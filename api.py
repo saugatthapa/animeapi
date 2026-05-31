@@ -653,7 +653,7 @@ def _anizone_episode_response(anilist_id: int, episodes: list[dict]) -> dict:
                 "sourceId": source_id,
             }
         )
-    return {"episodes": {"sub": items, "dub": []}}
+    return {"episodes": {"sub": items, "dub": items}}
 
 
 def _episode_slug_prefix(provider_name: str, episode_id, episode_number) -> str:
