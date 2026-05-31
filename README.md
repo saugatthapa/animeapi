@@ -197,7 +197,7 @@ To get a video stream, follow these 3 steps in order:
 
 #### Step 1: Get Episodes — `GET /episodes/{anilist_id}`
 
-Returns all episodes from multiple providers (kiwi, arc, zoro, jet, etc.) organized by audio type.
+Returns all episodes from multiple providers organized by audio type. Anizone is the primary/default provider when a confident AniList title match is found; existing providers remain fallback.
 
 AniList ID is always the primary streaming ID. MAL ID is backup-only:
 
@@ -230,25 +230,25 @@ MAL backup resolves `mal_id` to a numeric AniList ID before calling the streamin
 {
   "mappings": { "anilistId": 178005, "malId": 56885, "kitsuId": ... },
   "providers": {
-    "kiwi": {
+    "anizone": {
       "episodes": {
         "sub": [
           {
-            "id": "watch/kiwi/178005/sub/animepahe-1",
+            "id": "watch/anizone/178005/sub/ENCODED_EPISODE_URL",
+            "provider": "anizone",
             "number": 1,
             "title": "Episode Title",
-            "image": "https://serveproxy.com/url?url=...",
-            "airDate": "2026-01-04",
-            "duration": 1420,
-            "description": "...",
+            "image": null,
+            "airDate": null,
+            "duration": null,
+            "description": null,
             "filler": false
           }
         ],
-        "dub": [ ... ]
+        "dub": []
       }
     },
-    "arc": { ... },
-    "zoro": { ... }
+    "bonk": { "...": "fallback providers stay available" }
   }
 }
 ```
@@ -266,7 +266,7 @@ When the MAL backup route is used, returned episode IDs use the explicit backup 
 Just take the direct `id` from the Step 1 response and use it as the URL. No manual parameters or complex IDs needed!
 
 **Endpoint:** `GET /{id}`
-**Example:** `GET /watch/kiwi/178005/sub/animepahe-1`
+**Example:** `GET /watch/anizone/178005/sub/ENCODED_EPISODE_URL`
 
 For MAL backup responses, use the emitted backup ID, for example:
 `GET /watch-by-mal/6594/kiwi/sub/animepahe-1`
@@ -287,17 +287,47 @@ Do not open `/watch/mal-{id}`; MAL playback is supported only through `/watch-by
 ```
 
 > [!TIP]
-> This endpoint automatically handles decryption, provider selection, and category matching. It returns the direct M3U8/HLS streaming URL and intro/outro timestamps.
+> This endpoint automatically handles provider selection and category matching. The frontend should call `/episodes/{anilistId}` first and then request the returned episode `id`; do not manually build watch URLs unless debugging.
 
 <details>
 <summary><b>Fallback / Detailed Option</b></summary>
 If you need manual control, you can use the traditional endpoint:
 `GET /sources?episodeId=...&provider=...&anilistId=...&category=...`
+
+Anizone is also supported:
+`GET /sources?provider=anizone&episodeId=ENCODED_EPISODE_URL&anilistId=21&category=sub`
 </details>
 
 #### Step 3: Play
 
-Feed `streams[0].url` into any HLS player (Video.js, hls.js, VLC, mpv). Subtitles are either **hard-subbed** (baked into the video for kiwi/pahe) or provided in the `subtitles` array (VTT links for zoro/arc). Use `intro`/`outro` timestamps for skip buttons.
+Feed `streams[0].url` into any HLS player (Video.js, hls.js, VLC, mpv). Cached responses include `cached` and `response_time_ms` when served through the API cache. Anizone subtitles are returned in the `subtitles` array when the source page exposes subtitle tracks.
+
+#### Anizone Debug Endpoints
+
+```bash
+curl "http://localhost:8000/anizone/health"
+curl "http://localhost:8000/anizone/search?q=naruto"
+curl "http://localhost:8000/anizone/episodes?url=ENCODED_ANIZONE_ANIME_URL"
+curl "http://localhost:8000/anizone/sources?url=ENCODED_ANIZONE_EPISODE_URL"
+curl "http://localhost:8000/episodes/21"
+curl "http://localhost:8000/watch/anizone/21/sub/ENCODED_EPISODE_URL"
+curl "http://localhost:8000/sources?provider=anizone&episodeId=ENCODED_EPISODE_URL&anilistId=21&category=sub"
+```
+
+#### Streaming Environment
+
+```txt
+ANIZONE_BASE_URL=https://anizone.to
+ANIZONE_TIMEOUT_SECONDS=8
+PRIMARY_STREAM_PROVIDER=anizone
+STREAM_PROVIDER_ORDER=anizone,bonk,ally,dune,bee,hop,arc,zoro,jet,kiwi
+DISABLED_STREAM_PROVIDERS=kiwi
+ANIZONE_CACHE_SEARCH_TTL=1800
+ANIZONE_CACHE_EPISODES_TTL=21600
+ANIZONE_CACHE_SOURCES_TTL=600
+```
+
+AniList ID remains the main streaming ID. MAL IDs are used only for backup/resolution flows.
 
 <br>
 

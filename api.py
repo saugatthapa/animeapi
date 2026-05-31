@@ -1,4 +1,5 @@
 import asyncio, base64, json, gzip, httpx, os, re, time
+import hashlib
 from copy import deepcopy
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -12,6 +13,12 @@ from curl_cffi import requests as curl_requests
 from curl_cffi.requests.exceptions import Timeout as CurlTimeout, RequestException
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 import functools, random
+from providers.anizone_provider import AnizoneProvider, encode_anizone_url, normalize_anizone_url
+from providers.resolver import PRIMARY_STREAM_PROVIDER, STREAM_PROVIDER_ORDER, ProviderResolver
+
+
+def _safe_log_value(value: str) -> str:
+    return str(value or "").encode("ascii", errors="backslashreplace").decode("ascii")
 
 load_dotenv()
 
@@ -196,7 +203,7 @@ def _has_valid_api_key(request: Request) -> bool:
 @app.middleware("http")
 async def secure_api(request: Request, call_next):
     PUBLIC_PATHS = {"/", "/docs", "/redoc", "/openapi.json"}
-    if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/health"):
+    if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/health") or request.url.path == "/anizone/health":
         return await call_next(request)
 
     # Allow browser preflight OPTIONS requests without restrictions
@@ -263,6 +270,11 @@ DISABLED_STREAM_PROVIDERS = {
     for item in os.getenv("DISABLED_STREAM_PROVIDERS", "kiwi").split(",")
     if item.strip()
 }
+ANIZONE_CACHE_SEARCH_TTL = int(os.getenv("ANIZONE_CACHE_SEARCH_TTL", "1800"))
+ANIZONE_CACHE_MATCH_TTL = int(os.getenv("ANIZONE_CACHE_MATCH_TTL", "86400"))
+ANIZONE_CACHE_EPISODES_TTL = int(os.getenv("ANIZONE_CACHE_EPISODES_TTL", "21600"))
+ANIZONE_CACHE_SOURCES_TTL = int(os.getenv("ANIZONE_CACHE_SOURCES_TTL", "600"))
+ANIZONE_CACHE_HEALTH_TTL = int(os.getenv("ANIZONE_CACHE_HEALTH_TTL", "60"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPINGS_PATH = os.path.join(BASE_DIR, "mappings.json")
 MANGA_MAPPINGS_PATH = os.path.join(BASE_DIR, "manga_mappings.json")
@@ -312,6 +324,8 @@ def _load_local_manga_mappings():
 # Load mappings on startup
 _load_local_mappings()
 _load_local_manga_mappings()
+_provider_resolver = ProviderResolver()
+_anizone_provider = _provider_resolver.anizone
 
 # ─── Synchronous In-Memory Cache (for internal functions) ──────────────
 class _CacheEntry:
@@ -583,6 +597,64 @@ def _remove_disabled_stream_providers(data: dict) -> dict:
     return data
 
 
+def _order_stream_providers(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return data
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return data
+    ordered_names = _provider_resolver.order(providers.keys())
+    data["providers"] = {name: providers[name] for name in ordered_names if name in providers}
+    return data
+
+
+def _normalize_title_for_match(value: str) -> str:
+    value = re.sub(r"\([^)]*\)", " ", value or "")
+    value = re.sub(r"[^a-z0-9]+", " ", value.lower())
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _anizone_title_hash(titles: list[str]) -> str:
+    joined = "|".join(_normalize_title_for_match(title) for title in titles if title)
+    return hashlib.sha1(joined.encode()).hexdigest()[:16]
+
+
+def _decode_anizone_episode_id(value: str) -> str:
+    return normalize_anizone_url(value)
+
+
+def _anizone_watch_id(anilist_id: int, category: str, episode_url: str) -> str:
+    return f"watch/anizone/{anilist_id}/{category}/{encode_anizone_url(episode_url)}"
+
+
+def _anizone_episode_response(anilist_id: int, episodes: list[dict]) -> dict:
+    items = []
+    for index, episode in enumerate(episodes or [], start=1):
+        number = episode.get("number") or str(index)
+        try:
+            response_number = int(float(number))
+        except (TypeError, ValueError):
+            response_number = number
+        source_id = episode.get("sourceId") or episode.get("id")
+        if not source_id:
+            continue
+        items.append(
+            {
+                "id": _anizone_watch_id(anilist_id, "sub", source_id),
+                "provider": "anizone",
+                "number": response_number,
+                "title": episode.get("title") or f"Episode {number}",
+                "image": None,
+                "airDate": None,
+                "duration": None,
+                "description": None,
+                "filler": False,
+                "sourceId": source_id,
+            }
+        )
+    return {"episodes": {"sub": items, "dub": []}}
+
+
 def _episode_slug_prefix(provider_name: str, episode_id, episode_number) -> str:
     """Extract a stable provider slug without reusing already-wrapped watch routes."""
     if _is_animekai_provider(provider_name):
@@ -625,6 +697,8 @@ def _inject_source_slugs(data: dict, anilist_id: int):
                     continue
                 if "id" in ep and "number" in ep:
                     orig_id = ep["id"]
+                    if isinstance(orig_id, str) and orig_id.startswith(("watch/", "watch-by-mal/")):
+                        continue
                     prefix = _episode_slug_prefix(provider_name, orig_id, ep["number"])
                     ep["id"] = f"watch/{provider_name}/{anilist_id}/{category}/{prefix}-{ep['number']}"
     return data
@@ -652,6 +726,8 @@ def _inject_mal_source_slugs(data: dict, mal_id: int):
                     continue
                 if "id" in ep and "number" in ep:
                     orig_id = ep["id"]
+                    if isinstance(orig_id, str) and orig_id.startswith(("watch/", "watch-by-mal/")):
+                        continue
                     prefix = _episode_slug_prefix(provider_name, orig_id, ep["number"])
                     ep["id"] = f"watch-by-mal/{mal_id}/{provider_name}/{category}/{prefix}-{ep['number']}"
     return data
@@ -4299,6 +4375,150 @@ async def get_anime_recommendations(
 
 # ─── Streaming (Pipe-based with MAL backup) ─────────────────────────────────
 
+async def _anizone_search_cached(query: str) -> dict:
+    async def fetch_fn():
+        return {"results": await _anizone_provider.search(query)}
+
+    return await _cached_response("anizone_search", ANIZONE_CACHE_SEARCH_TTL, fetch_fn, query.strip().lower())
+
+
+async def _anizone_episodes_cached(anime_url: str) -> dict:
+    normalized_url = normalize_anizone_url(anime_url)
+
+    async def fetch_fn():
+        return {"episodes": await _anizone_provider.get_episodes(normalized_url)}
+
+    return await _cached_response("anizone_episodes", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, normalized_url)
+
+
+async def _anizone_sources_cached(episode_url: str) -> dict:
+    normalized_url = normalize_anizone_url(episode_url)
+
+    async def fetch_fn():
+        return await _anizone_provider.get_sources(normalized_url)
+
+    return await _cached_response("anizone_sources", ANIZONE_CACHE_SOURCES_TTL, fetch_fn, normalized_url)
+
+
+async def _anizone_health_cached() -> dict:
+    async def fetch_fn():
+        return await _anizone_provider.health()
+
+    return await _cached_response("anizone_health", ANIZONE_CACHE_HEALTH_TTL, fetch_fn, "status")
+
+
+async def _anizone_title_candidates(anilist_id: int) -> dict:
+    gql = """
+    query ($id: Int) {
+      Media(id: $id, type: ANIME) {
+        id
+        title { romaji english native }
+        synonyms
+        seasonYear
+        episodes
+        startDate { year }
+      }
+    }
+    """
+    data = await _anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media") or {}
+    title_data = media.get("title") or {}
+    titles = []
+    for value in (title_data.get("english"), title_data.get("romaji"), title_data.get("native")):
+        if value and value.isascii() and value not in titles:
+            titles.append(value)
+    for value in media.get("synonyms") or []:
+        if value and value.isascii() and value not in titles:
+            titles.append(value)
+    return {
+        "titles": titles,
+        "year": media.get("seasonYear") or (media.get("startDate") or {}).get("year"),
+        "episodes": media.get("episodes"),
+    }
+
+
+def _score_anizone_match(candidate: dict, titles: list[str], year=None, episode_count=None) -> int:
+    candidate_title = _normalize_title_for_match(candidate.get("title", ""))
+    normalized_titles = [_normalize_title_for_match(title) for title in titles if title]
+    if not candidate_title or not normalized_titles:
+        return 0
+
+    score = 0
+    if candidate_title in normalized_titles:
+        score += 100
+    elif any(candidate_title in title or title in candidate_title for title in normalized_titles):
+        score += 70
+    elif any(set(candidate_title.split()) & set(title.split()) for title in normalized_titles):
+        score += 25
+
+    info = str(candidate.get("info") or "")
+    if year and str(year) in info:
+        score += 15
+    available = candidate.get("availableEpisodes") or 0
+    if episode_count and available and int(available) == int(episode_count):
+        score += 15
+    return score
+
+
+async def _find_anizone_match(anilist_id: int) -> Optional[dict]:
+    if _is_disabled_stream_provider("anizone"):
+        print(f"[Anizone] fallback reason=disabled anilistId={anilist_id}")
+        return None
+
+    info = await _anizone_title_candidates(anilist_id)
+    titles = info.get("titles") or []
+    if not titles:
+        print(f"[Anizone] fallback reason=no_titles anilistId={anilist_id}")
+        return None
+
+    title_hash = _anizone_title_hash(titles)
+
+    async def fetch_fn():
+        best = None
+        best_score = 0
+        for title in titles[:5]:
+            try:
+                search_data = await _anizone_search_cached(title)
+                for candidate in search_data.get("results", []):
+                    score = _score_anizone_match(candidate, titles, info.get("year"), info.get("episodes"))
+                    if score > best_score:
+                        best = candidate
+                        best_score = score
+                if best_score >= 100:
+                    break
+            except Exception as exc:
+                print(f"[Anizone] search failed title={_safe_log_value(title)}: {exc}")
+                continue
+        if not best or best_score < 70:
+            print(f"[Anizone] fallback reason=no_confident_match anilistId={anilist_id} score={best_score}")
+            return {}
+        print(f"[Anizone] match anilistId={anilist_id} title={_safe_log_value(best.get('title'))} score={best_score}")
+        return {"match": best, "score": best_score}
+
+    cached = await _cached_response("anizone_match", ANIZONE_CACHE_MATCH_TTL, fetch_fn, str(anilist_id), title_hash)
+    return cached.get("match")
+
+
+async def _inject_anizone_provider(data: dict, anilist_id: int) -> dict:
+    if _is_disabled_stream_provider("anizone"):
+        return data
+    try:
+        match = await _find_anizone_match(anilist_id)
+        if not match:
+            return data
+        episodes_data = await _anizone_episodes_cached(match["id"])
+        episodes = episodes_data.get("episodes") or []
+        if not episodes:
+            print(f"[Anizone] fallback reason=no_episodes anilistId={anilist_id}")
+            return data
+        providers = data.setdefault("providers", {})
+        providers["anizone"] = _anizone_episode_response(anilist_id, episodes)
+        return _order_stream_providers(data)
+    except Exception as exc:
+        print(f"[Anizone] fallback reason=exception anilistId={anilist_id} error={exc}")
+        return data
+
+
 @app.get("/episodes/mal-{mal_id}")
 async def get_episodes_by_mal_slug(mal_id: int):
     """Get episodes from a MAL ID by resolving to numeric AniList internally."""
@@ -4313,7 +4533,8 @@ async def get_episodes_by_mal_slug(mal_id: int):
         "source": backup["source"],
         "anilistId": backup["anilistId"],
     }
-    return _proxy_deep_images(_remove_disabled_stream_providers(_inject_mal_source_slugs(data, mal_id)))
+    data = await _inject_anizone_provider(data, backup["anilistId"])
+    return _proxy_deep_images(_order_stream_providers(_remove_disabled_stream_providers(_inject_mal_source_slugs(data, mal_id))))
 
 
 @app.get("/episodes/{anilist_id}")
@@ -4323,13 +4544,24 @@ async def get_episodes(
 ):
     """Get the episode list for an anime, with MAL backup only after AniList fails."""
     async def fetch_fn():
+        anizone_data = await _inject_anizone_provider({"providers": {}}, anilist_id)
+        has_anizone = bool(anizone_data.get("providers", {}).get("anizone"))
+        if has_anizone:
+            return _proxy_deep_images(_order_stream_providers(anizone_data))
+
         data, error = await _try_episode_fetch({"anilistId": anilist_id})
         if data is not None:
-            return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
+            data = await _inject_anizone_provider(data, anilist_id)
+            return _proxy_deep_images(_order_stream_providers(_inject_source_slugs(data, anilist_id)))
 
-        animekai_only = await _animekai_only_episode_payload(anilist_id)
+        try:
+            animekai_only = await _animekai_only_episode_payload(anilist_id)
+        except Exception as exc:
+            print(f"[ANIMEKAI WARN] AnimeKai-only fallback failed for {anilist_id}: {exc}")
+            animekai_only = None
         if animekai_only is not None:
-            return _proxy_deep_images(_inject_source_slugs(animekai_only, anilist_id))
+            animekai_only = await _inject_anizone_provider(animekai_only, anilist_id)
+            return _proxy_deep_images(_order_stream_providers(_inject_source_slugs(animekai_only, anilist_id)))
 
         if malId is None:
             _raise_pipe_lookup_error(error, "AniList episode lookup failed")
@@ -4345,16 +4577,47 @@ async def get_episodes(
             "source": backup["source"],
             "anilistId": backup["anilistId"],
         }
-        return _proxy_deep_images(_inject_mal_source_slugs(data, malId))
+        data = await _inject_anizone_provider(data, backup["anilistId"])
+        return _proxy_deep_images(_order_stream_providers(_inject_mal_source_slugs(data, malId)))
 
     data = await _cached_response("episodes", 43200, fetch_fn, str(anilist_id))
-    return _remove_disabled_stream_providers(data)
+    return _order_stream_providers(_remove_disabled_stream_providers(data))
 
 
 @app.get("/episodes-by-mal/{malId}")
 async def get_episodes_by_mal(malId: int):
     """Get episodes using the explicit MAL backup route."""
     return await get_episodes_by_mal_slug(malId)
+
+
+@app.get("/anizone/health")
+async def anizone_health():
+    return await _anizone_health_cached()
+
+
+@app.get("/anizone/search")
+async def anizone_search(q: str = Query(..., min_length=1)):
+    return await _anizone_search_cached(q)
+
+
+@app.get("/anizone/episodes")
+async def anizone_episodes(url: str = Query(..., description="Anizone anime URL or base64-url encoded URL")):
+    try:
+        return await _anizone_episodes_cached(url)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Anizone URL")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Anizone episodes unavailable")
+
+
+@app.get("/anizone/sources")
+async def anizone_sources(url: str = Query(..., description="Anizone episode URL or base64-url encoded URL")):
+    try:
+        return await _anizone_sources_cached(url)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Anizone URL")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Anizone source unavailable")
 
 
 @app.get("/sources")
@@ -4367,6 +4630,26 @@ async def get_sources(
     """Get M3U8 streaming sources for a specific episode."""
     if _is_disabled_stream_provider(provider):
         raise HTTPException(status_code=410, detail=f"Provider '{provider}' is disabled")
+
+    if (provider or "").lower() == "anizone":
+        try:
+            episode_url = _decode_anizone_episode_id(episodeId)
+            data = await _anizone_sources_cached(episode_url)
+            data["provider"] = "anizone"
+            return _proxy_deep_images(data)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Anizone URL")
+        except HTTPException:
+            raise
+        except Exception:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "detail": "Anizone source unavailable",
+                    "provider": "anizone",
+                    "fallbackAvailable": True,
+                },
+            )
 
     if _is_animekai_provider(provider):
         data = await _animekai_sources_from_episode_id(episodeId, category)
@@ -4423,6 +4706,9 @@ async def get_watch_sources(provider: str, anilist_id: str, category: str, slug:
     except (TypeError, ValueError):
         raise HTTPException(status_code=422, detail="Invalid AniList route segment")
 
+    if (provider or "").lower() == "anizone":
+        return await get_sources(episodeId=slug, provider="anizone", anilistId=resolved_anilist_id, category=category)
+
     if _is_animekai_provider(provider):
         normalized_slug = _normalize_animekai_watch_slug(slug)
         match = re.search(r"animekai-(\d+)", normalized_slug)
@@ -4465,6 +4751,9 @@ async def get_watch_sources_by_mal(malId: int, provider: str, category: str, epi
         return _mal_mapping_required_response(malId)
 
     anilist_id = resolution["anilistId"]
+    if (provider or "").lower() == "anizone":
+        return await get_sources(episodeId=episodeId, provider="anizone", anilistId=anilist_id, category=category)
+
     if _is_animekai_provider(provider):
         normalized_slug = _normalize_animekai_watch_slug(episodeId)
         match = re.search(r"animekai-(\d+)", normalized_slug)

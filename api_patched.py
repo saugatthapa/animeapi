@@ -119,7 +119,8 @@ async def safe_get_episodes_by_mal_slug(mal_id: int):
         "source": backup["source"],
         "anilistId": backup["anilistId"],
     }
-    return _api._proxy_deep_images(_api._inject_mal_source_slugs(data, mal_id))
+    data = await _api._inject_anizone_provider(data, backup["anilistId"])
+    return _api._proxy_deep_images(_api._order_stream_providers(_api._inject_mal_source_slugs(data, mal_id)))
 
 
 async def safe_get_episodes_by_mal(malId: int):
@@ -141,6 +142,14 @@ async def safe_get_watch_sources(provider: str, anilist_id: str, category: str, 
         raise HTTPException(status_code=422, detail="Invalid AniList route segment")
 
     try:
+        if (provider or "").lower() == "anizone":
+            return await _api.get_sources(
+                episodeId=slug,
+                provider="anizone",
+                anilistId=resolved_anilist_id,
+                category=category,
+            )
+
         if _api._is_animekai_provider(provider):
             normalized_slug = _api._normalize_animekai_watch_slug(slug)
             match = re.search(r"animekai-(\d+)", normalized_slug)
@@ -192,6 +201,14 @@ async def safe_get_watch_sources_by_mal(malId: int, provider: str, category: str
     anilist_id = resolution["anilistId"]
 
     try:
+        if (provider or "").lower() == "anizone":
+            return await _api.get_sources(
+                episodeId=episodeId,
+                provider="anizone",
+                anilistId=anilist_id,
+                category=category,
+            )
+
         if _api._is_animekai_provider(provider):
             normalized_slug = _api._normalize_animekai_watch_slug(episodeId)
             match = re.search(r"animekai-(\d+)", normalized_slug)
