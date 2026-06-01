@@ -157,13 +157,15 @@ class AnizoneProvider:
             )
         return results
 
-    async def get_episodes(self, anime_url: str) -> list[dict]:
+    async def get_episodes(self, anime_url: str, start: int = 1, limit: int = 100) -> tuple[list, int, bool]:
         normalized_url = normalize_anizone_url(anime_url)
 
         all_episodes = []
         seen_urls = set()
         page = 1
-        max_pages = 10  # safety cap (10 * 36 = 360 episodes, covers most anime)
+        max_pages = 50
+        has_more = False
+        target_count = start + limit - 1
 
         async def fetch_page(p: int) -> BeautifulSoup:
             page_url = f"{normalized_url}?page={p}" if p > 1 else normalized_url
@@ -215,11 +217,31 @@ class AnizoneProvider:
             if not page_has_new:
                 break
 
+            # If we have enough episodes to cover the requested range,
+            # peek at next page to determine has_more, then stop
+            if len(all_episodes) >= target_count:
+                try:
+                    next_soup = await fetch_page(page + 1)
+                    next_candidates = list(next_soup.select("ul.grid li a"))
+                    if not next_candidates:
+                        anime_path = urlparse(normalized_url).path.rstrip("/")
+                        next_candidates = [
+                            element
+                            for element in next_soup.select("a[href]")
+                            if urlparse(absolute_url(element.get("href") or "")).path.startswith(f"{anime_path}/")
+                        ]
+                    has_more = len(next_candidates) > 0
+                except Exception:
+                    has_more = False
+                break
+
             page += 1
 
         all_episodes.sort(key=_episode_sort_key)
-        print(f"[Anizone] episodes count={len(all_episodes)} pages={page}")
-        return all_episodes
+        total_known = len(all_episodes)
+        sliced = all_episodes[max(0, start - 1):start - 1 + limit]
+        print(f"[Anizone] episodes count={total_known} pages={page} has_more={has_more}")
+        return sliced, total_known, has_more
 
     async def get_sources(self, episode_url: str) -> dict:
         normalized_url = normalize_anizone_url(episode_url)

@@ -276,6 +276,8 @@ ANIZONE_CACHE_MATCH_TTL = int(os.getenv("ANIZONE_CACHE_MATCH_TTL", "86400"))
 ANIZONE_CACHE_EPISODES_TTL = int(os.getenv("ANIZONE_CACHE_EPISODES_TTL", "21600"))
 ANIZONE_CACHE_SOURCES_TTL = int(os.getenv("ANIZONE_CACHE_SOURCES_TTL", "600"))
 ANIZONE_CACHE_HEALTH_TTL = int(os.getenv("ANIZONE_CACHE_HEALTH_TTL", "60"))
+LATEST_EPISODES_CACHE_TTL = int(os.getenv("LATEST_EPISODES_CACHE_TTL", os.getenv("HOME_CACHE_TTL", "60")))
+HOME_CACHE_TTL = int(os.getenv("HOME_CACHE_TTL", "60"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAPPINGS_PATH = os.path.join(BASE_DIR, "mappings.json")
 MANGA_MAPPINGS_PATH = os.path.join(BASE_DIR, "manga_mappings.json")
@@ -636,19 +638,28 @@ def _merge_anizone_and_miruro_episodes(anilist_id: int, anizone_data: Optional[d
         "warnings": warnings,
     }
 
-    # Add Anizone first
+    # Preserve Anizone total/episode count metadata for accurate hasMore/totalKnown
     if isinstance(anizone_data, dict):
-        anizone_eps = []
-        eps = anizone_data.get("episodes")
+        anizone_total = anizone_data.get("_anizoneTotalKnown", 0)
+        anizone_has_more = anizone_data.get("_anizoneHasMore", False)
+        if anizone_total:
+            result["_anizoneTotalKnown"] = anizone_total
+            result["_anizoneHasMore"] = anizone_has_more
+
+    # Extract Anizone from providers dict (returned by _inject_anizone_provider)
+    if isinstance(anizone_data, dict):
+        anizone_prov = anizone_data.get("providers", {})
+        anizone_entry = anizone_prov.get("anizone", {}) if isinstance(anizone_prov, dict) else {}
+        eps = anizone_entry.get("episodes")
         if isinstance(eps, dict):
             anizone_eps = eps.get("sub", []) if isinstance(eps.get("sub"), list) else []
-        if anizone_eps:
-            result["providers"]["anizone"] = {
-                "id": "anizone",
-                "name": "Anizone",
-                "episodes": {"sub": anizone_eps, "dub": anizone_eps},
-            }
-            result["episodes"]["sub"] = anizone_eps
+            if anizone_eps:
+                result["providers"]["anizone"] = {
+                    "id": "anizone",
+                    "name": "Anizone",
+                    "episodes": {"sub": anizone_eps, "dub": anizone_eps},
+                }
+                result["episodes"]["sub"] = anizone_eps
 
     # Add Miruro providers after Anizone
     miruro_providers = miruro_data.get("providers", {}) if isinstance(miruro_data, dict) else {}
@@ -684,6 +695,76 @@ def _merge_anizone_and_miruro_episodes(anilist_id: int, anizone_data: Optional[d
                 result["episodes"] = {"sub": sub_eps, "dub": dub_eps}
                 break
 
+    return result
+
+
+def _episode_list_total(eps_list: list) -> int:
+    """Get the highest episode number from a sorted list."""
+    max_num = 0
+    for ep in eps_list:
+        try:
+            n = int(float(ep.get("number", 0)))
+            if n > max_num:
+                max_num = n
+        except (TypeError, ValueError):
+            pass
+    return max_num
+
+
+def _slice_episode_data(data: dict, start: int, limit: int) -> dict:
+    """Slice each provider's episode list to [start, start+limit) and add metadata.
+    Uses Anizone totalKnown/hasMore as fallback when miruro providers are not available."""
+    if not isinstance(data, dict):
+        return data
+    result = dict(data)
+    providers = result.get("providers")
+    if not isinstance(providers, dict):
+        return result
+
+    total_from_lists = 0
+    max_ep_num = 0
+
+    for prov_name, prov_data in providers.items():
+        if not isinstance(prov_data, dict):
+            continue
+        eps = prov_data.get("episodes")
+        if not isinstance(eps, dict):
+            continue
+        sliced_eps = {}
+        for lang in ("sub", "dub"):
+            lst = eps.get(lang, [])
+            if not isinstance(lst, list):
+                sliced_eps[lang] = []
+                continue
+            total_from_lists = max(total_from_lists, len(lst))
+            max_ep_num = max(max_ep_num, _episode_list_total(lst))
+            sliced_eps[lang] = lst[max(0, start - 1):start - 1 + limit]
+        prov_data["episodes"] = sliced_eps
+
+    # Slice top-level episodes
+    top_eps = result.get("episodes")
+    if isinstance(top_eps, dict):
+        for lang in ("sub", "dub"):
+            lst = top_eps.get(lang, [])
+            if isinstance(lst, list):
+                top_eps[lang] = lst[max(0, start - 1):start - 1 + limit]
+
+    end = start + limit - 1
+    # Use best available total: miruro list lengths > anizone metadata > ep numbers
+    anizone_total = result.get("_anizoneTotalKnown", 0) or 0
+    anizone_has_more = result.get("_anizoneHasMore", False) or False
+    total_known = max(total_from_lists, anizone_total, max_ep_num)
+    has_more = anizone_has_more or end < max_ep_num or end < total_known
+
+    # Clean up internal keys
+    result.pop("_anizoneTotalKnown", None)
+    result.pop("_anizoneHasMore", None)
+
+    result["start"] = start
+    result["end"] = end
+    result["limit"] = limit
+    result["hasMore"] = has_more
+    result["totalKnown"] = total_known
     return result
 
 
@@ -4049,6 +4130,65 @@ async def _fetch_collection(sort_type: str, status: str = None, page: int = 1, p
     return _proxy_deep_images(response)
 
 
+async def _fetch_latest_airing_episodes(page: int = 1, per_page: int = 20):
+    """Fetch anime ordered by actual recently aired episode time, not anime start date."""
+    now = int(time.time())
+    after = now - 14 * 24 * 60 * 60
+    gql = f"""
+    query ($page: Int, $perPage: Int, $now: Int, $after: Int) {{
+        Page(page: $page, perPage: $perPage) {{
+            pageInfo {{ total currentPage lastPage hasNextPage perPage }}
+            airingSchedules(
+                airingAt_lesser: $now
+                airingAt_greater: $after
+                sort: TIME_DESC
+                notYetAired: false
+            ) {{
+                episode
+                airingAt
+                media {{
+                    {MEDIA_LIST_FIELDS}
+                }}
+            }}
+        }}
+    }}
+    """
+    data = await _anilist_query(gql, {"page": page, "perPage": min(per_page * 2, 50), "now": now, "after": after})
+    page_data = data.get("Page", {})
+    page_info = page_data.get("pageInfo", {})
+    seen = set()
+    results = []
+    for item in page_data.get("airingSchedules", []):
+        media = item.get("media") or {}
+        media_id = media.get("id")
+        if not media_id or media.get("isAdult") or media_id in seen:
+            continue
+        seen.add(media_id)
+        entry = dict(media)
+        entry["latestEpisode"] = item.get("episode")
+        entry["latestAiringAt"] = item.get("airingAt")
+        results.append(entry)
+        if len(results) >= per_page:
+            break
+
+    if results:
+        newest = results[0]
+        newest_title = (newest.get("title") or {}).get("english") or (newest.get("title") or {}).get("romaji") or newest.get("id")
+        age_minutes = max(0, int((now - int(newest.get("latestAiringAt") or now)) / 60))
+        print(f"[Latest] provider=anilist count={len(results)} newest={_safe_log_value(newest_title)} ep={newest.get('latestEpisode')} age={age_minutes}m")
+    else:
+        print("[Latest] provider=anilist count=0")
+
+    response = {
+        "page": page_info.get("currentPage", page),
+        "perPage": per_page,
+        "total": page_info.get("total", 0),
+        "hasNextPage": page_info.get("hasNextPage", False),
+        "results": results,
+    }
+    return _proxy_deep_images(response)
+
+
 @app.get("/spotlight")
 async def get_spotlight():
     """Get the spotlight anime – high-priority trending and popular titles."""
@@ -4104,10 +4244,19 @@ async def get_recent(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=50),
 ):
-    """Get currently airing anime with full metadata and pagination."""
+    """Get latest aired episodes with full metadata and pagination."""
     async def fn():
-        return await _fetch_collection("START_DATE_DESC", "RELEASING", page=page, per_page=per_page)
-    return await _cached_response("recent", 600, fn, str(page), str(per_page))
+        return await _fetch_latest_airing_episodes(page=page, per_page=per_page)
+    return await _cached_response("latest_episodes:v2", LATEST_EPISODES_CACHE_TTL, fn, str(page), str(per_page))
+
+
+@app.get("/latest")
+async def get_latest(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=50),
+):
+    """Alias for latest aired episodes."""
+    return await get_recent(page=page, per_page=per_page)
 
 
 @app.get("/home-data")
@@ -4120,7 +4269,7 @@ async def get_home_data():
         trending, popular, recent, upcoming = await asyncio.gather(
             fetch_section("TRENDING_DESC"),
             fetch_section("POPULARITY_DESC"),
-            fetch_section("START_DATE_DESC", "RELEASING"),
+            _fetch_latest_airing_episodes(page=1, per_page=20),
             fetch_section("POPULARITY_DESC", "NOT_YET_RELEASED", limit=10),
         )
         return {
@@ -4130,7 +4279,7 @@ async def get_home_data():
             "upcoming": upcoming.get("results", []),
         }
 
-    return await _cached_response("home", 600, fetch_fn, "v1")
+    return await _cached_response("home:v2", HOME_CACHE_TTL, fetch_fn, "latest-v2")
 
 
 @app.get("/schedule")
@@ -4442,13 +4591,14 @@ async def _anizone_search_cached(query: str) -> dict:
     return await _cached_response("anizone_search", ANIZONE_CACHE_SEARCH_TTL, fetch_fn, query.strip().lower())
 
 
-async def _anizone_episodes_cached(anime_url: str) -> dict:
+async def _anizone_episodes_cached(anime_url: str, start: int = 1, limit: int = 100) -> dict:
     normalized_url = normalize_anizone_url(anime_url)
 
     async def fetch_fn():
-        return {"episodes": await _anizone_provider.get_episodes(normalized_url)}
+        episodes, total_known, has_more = await _anizone_provider.get_episodes(normalized_url, start=start, limit=limit)
+        return {"episodes": episodes, "totalKnown": total_known, "hasMore": has_more}
 
-    return await _cached_response("anizone_episodes:v2", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, normalized_url)
+    return await _cached_response("anizone_episodes:v3", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, normalized_url, str(start), str(limit))
 
 
 async def _anizone_sources_cached(episode_url: str) -> dict:
@@ -4559,20 +4709,22 @@ async def _find_anizone_match(anilist_id: int) -> Optional[dict]:
     return cached.get("match")
 
 
-async def _inject_anizone_provider(data: dict, anilist_id: int) -> dict:
+async def _inject_anizone_provider(data: dict, anilist_id: int, start: int = 1, limit: int = 100) -> dict:
     if _is_disabled_stream_provider("anizone"):
         return data
     try:
         match = await _find_anizone_match(anilist_id)
         if not match:
             return data
-        episodes_data = await _anizone_episodes_cached(match["id"])
+        episodes_data = await _anizone_episodes_cached(match["id"], start=start, limit=limit)
         episodes = episodes_data.get("episodes") or []
         if not episodes:
             print(f"[Anizone] fallback reason=no_episodes anilistId={anilist_id}")
             return data
         providers = data.setdefault("providers", {})
         providers["anizone"] = _anizone_episode_response(anilist_id, episodes)
+        data["_anizoneTotalKnown"] = episodes_data.get("totalKnown", 0)
+        data["_anizoneHasMore"] = episodes_data.get("hasMore", False)
         return _order_stream_providers(data)
     except Exception as exc:
         print(f"[Anizone] fallback reason=exception anilistId={anilist_id} error={exc}")
@@ -4601,19 +4753,28 @@ async def get_episodes_by_mal_slug(mal_id: int):
 async def get_episodes(
     anilist_id: int,
     malId: Optional[int] = Query(None, description="Optional MAL ID to use only if the AniList lookup fails"),
+    start: int = Query(1, ge=1, description="Episode range start (1-indexed)"),
+    limit: int = Query(100, ge=1, le=500, description="Number of episodes to return (used only if end is not set)"),
+    end: Optional[int] = Query(None, ge=1, description="Episode range end (inclusive). Overrides limit if set."),
 ):
     """Get the episode list merging Anizone + Miruro providers.
+    Supports range-based lazy loading via start/end or start/limit.
     Returns 200 whenever at least one provider has episodes.
     Never returns 500 — provider failures are collected as warnings.
     """
+    if end is not None:
+        if end < start:
+            end = start
+        limit = min(end - start + 1, 500)
+    print(f"[episodes] anilist_id={anilist_id}, start={start}, limit={limit}, end={end}")
     async def fetch_fn():
         warnings = []
         anizone_data = None
         miruro_data = None
 
-        # 1. Fetch Anizone episodes (soft fail)
+        # 1. Fetch Anizone episodes (soft fail) — only fetches pages needed for range
         try:
-            anizone_data = await _inject_anizone_provider({"providers": {}}, anilist_id)
+            anizone_data = await _inject_anizone_provider({"providers": {}}, anilist_id, start=start, limit=limit)
         except Exception as exc:
             warnings.append(f"anizone lookup failed: {exc}")
 
@@ -4639,7 +4800,7 @@ async def get_episodes(
 
             if animekai_only is not None:
                 try:
-                    animekai_only = await _inject_anizone_provider(animekai_only, anilist_id)
+                    animekai_only = await _inject_anizone_provider(animekai_only, anilist_id, start=start, limit=limit)
                 except Exception as exc:
                     warnings.append(f"anizone inject into animekai failed: {exc}")
                 result = _merge_anizone_and_miruro_episodes(
@@ -4677,8 +4838,23 @@ async def get_episodes(
         result["warnings"] = warnings
         return result
 
-    data = await _cached_response("episodes:v3", 43200, fetch_fn, str(anilist_id))
-    return _order_stream_providers(_remove_disabled_stream_providers(data))
+    full_data = await _cached_response("episodes:v4", 43200, fetch_fn, str(anilist_id), str(start), str(limit))
+    sliced = _slice_episode_data(full_data, start, limit)
+    ordered = _order_stream_providers(_remove_disabled_stream_providers(sliced))
+    if int(anilist_id) == 202957:
+        debug_summary = {}
+        for provider_name, provider_data in (ordered.get("providers") or {}).items():
+            episodes = provider_data.get("episodes", {}) if isinstance(provider_data, dict) else {}
+            sub_eps = episodes.get("sub", []) if isinstance(episodes, dict) else []
+            nums = []
+            for ep in sub_eps:
+                try:
+                    nums.append(int(float(ep.get("number"))))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            debug_summary[provider_name] = sorted(set(nums))
+        print(f"[Episodes Debug] title=Star Detective anilist_id={anilist_id} providers={debug_summary}")
+    return ordered
 
 
 @app.get("/episodes-by-mal/{malId}")
@@ -4700,7 +4876,7 @@ async def anizone_search(q: str = Query(..., min_length=1)):
 @app.get("/anizone/episodes")
 async def anizone_episodes(url: str = Query(..., description="Anizone anime URL or base64-url encoded URL")):
     try:
-        return await _anizone_episodes_cached(url)
+        return await _anizone_episodes_cached(url, start=1, limit=9999)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid Anizone URL")
     except Exception:
