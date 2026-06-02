@@ -14,7 +14,13 @@ from curl_cffi.requests.exceptions import Timeout as CurlTimeout, RequestExcepti
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 import functools, random
 from providers.anizone_provider import AnizoneProvider, encode_anizone_url, normalize_anizone_url
-from providers.resolver import PRIMARY_STREAM_PROVIDER, STREAM_PROVIDER_ORDER, ProviderResolver
+from providers.resolver import (
+    BACKUP_STREAM_PROVIDERS,
+    MAIN_STREAM_PROVIDERS,
+    PRIMARY_STREAM_PROVIDER,
+    STREAM_PROVIDER_ORDER,
+    ProviderResolver,
+)
 
 
 def _safe_log_value(value: str) -> str:
@@ -27,12 +33,15 @@ app = FastAPI(title="Miruro API", version="2.8")
 # ─── Async Redis Cache ───────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL")
 _redis_pool = None
+_redis_missing_logged = False
 
 async def _get_redis():
-    global _redis_pool
+    global _redis_missing_logged, _redis_pool
     if _redis_pool is None:
         if not REDIS_URL:
-            print("[Cache] REDIS_URL not set — running without Redis")
+            if not _redis_missing_logged:
+                print("[Cache] REDIS_URL not set - running without Redis")
+                _redis_missing_logged = True
             return None
         try:
             import redis.asyncio as aio_redis
@@ -203,7 +212,13 @@ def _has_valid_api_key(request: Request) -> bool:
 @app.middleware("http")
 async def secure_api(request: Request, call_next):
     PUBLIC_PATHS = {"/", "/docs", "/redoc", "/openapi.json"}
-    if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/health") or request.url.path == "/anizone/health":
+    if (
+        request.url.path in PUBLIC_PATHS
+        or request.url.path.startswith("/health")
+        or request.url.path == "/anizone/health"
+        or request.url.path == "/maintenance/status"
+        or request.url.path == "/api/ads/status"
+    ):
         return await call_next(request)
         return await call_next(request)
 
@@ -251,6 +266,18 @@ async def secure_api(request: Request, call_next):
             content={"detail": "Access forbidden: Invalid Origin, Referer, or API Key."}
         )
 
+    if not _maintenance_allowed(request.url.path):
+        maintenance = await _get_maintenance_state()
+        if maintenance.get("enabled"):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "maintenance": True,
+                    "message": "Animio is currently under maintenance.",
+                    "reason": maintenance.get("reason") or "",
+                },
+            )
+
     return await call_next(request)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://www.miruro.tv/"}
@@ -266,6 +293,8 @@ ENABLE_STREAM_PROXY = os.getenv("ENABLE_STREAM_PROXY", "0").strip().lower() in {
 ENABLE_SUBTITLE_FALLBACKS = os.getenv("ENABLE_SUBTITLE_FALLBACKS", "0").strip().lower() in {"1", "true", "yes"}
 STREAM_PROXY_TIMEOUT_SECONDS = float(os.getenv("STREAM_PROXY_TIMEOUT_SECONDS", "2.5"))
 SUBTITLE_FALLBACK_TIMEOUT_SECONDS = float(os.getenv("SUBTITLE_FALLBACK_TIMEOUT_SECONDS", "4"))
+MAX_PROVIDER_CONCURRENCY = max(1, int(os.getenv("MAX_PROVIDER_CONCURRENCY", "5")))
+PER_PROVIDER_SOURCE_TIMEOUT_SECONDS = float(os.getenv("PER_PROVIDER_SOURCE_TIMEOUT_SECONDS", "5"))
 DISABLED_STREAM_PROVIDERS = {
     item.strip().lower()
     for item in os.getenv("DISABLED_STREAM_PROVIDERS", "kiwi").split(",")
@@ -276,6 +305,21 @@ ANIZONE_CACHE_MATCH_TTL = int(os.getenv("ANIZONE_CACHE_MATCH_TTL", "86400"))
 ANIZONE_CACHE_EPISODES_TTL = int(os.getenv("ANIZONE_CACHE_EPISODES_TTL", "21600"))
 ANIZONE_CACHE_SOURCES_TTL = int(os.getenv("ANIZONE_CACHE_SOURCES_TTL", "600"))
 ANIZONE_CACHE_HEALTH_TTL = int(os.getenv("ANIZONE_CACHE_HEALTH_TTL", "60"))
+EPISODE_INDEX_CACHE_TTL = int(os.getenv("EPISODE_INDEX_CACHE_TTL", "21600"))
+EPISODE_INDEX_TIMEOUT_SECONDS = float(os.getenv("EPISODE_INDEX_TIMEOUT_SECONDS", "3"))
+PRESENCE_TTL_SECONDS = int(os.getenv("PRESENCE_TTL_SECONDS", "420"))
+PRESENCE_REDIS_KEY = os.getenv("PRESENCE_REDIS_KEY", "presence:online")
+PRESENCE_TAB_PREFIX = os.getenv("PRESENCE_TAB_PREFIX", "presence:tab")
+PRESENCE_COUNT_CACHE_KEY = os.getenv("PRESENCE_COUNT_CACHE_KEY", "presence:count:cache")
+PRESENCE_COUNT_CACHE_TTL = int(os.getenv("PRESENCE_COUNT_CACHE_TTL", "10"))
+DISCORD_BOT_STATUS_URL = os.getenv("DISCORD_BOT_STATUS_URL", "http://panel.thapasir.qzz.io:25602/bot-status")
+BOT_STATUS_CACHE_KEY = os.getenv("BOT_STATUS_CACHE_KEY", "bot:status:cache")
+BOT_STATUS_CACHE_TTL = int(os.getenv("BOT_STATUS_CACHE_TTL", "8"))
+DEBUG_EPISODE_ANIME_IDS = {
+    item.strip()
+    for item in os.getenv("DEBUG_EPISODE_ANIME_IDS", "").split(",")
+    if item.strip()
+}
 LATEST_EPISODES_CACHE_TTL = int(os.getenv("LATEST_EPISODES_CACHE_TTL", os.getenv("HOME_CACHE_TTL", "60")))
 HOME_CACHE_TTL = int(os.getenv("HOME_CACHE_TTL", "60"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -364,9 +408,28 @@ def _set_cache(cache_type: str, key: str, data, ttl_hours: int):
 def _log_timing(name: str, start: float):
     elapsed = time.time() - start
     if elapsed > 1:
-        print(f"[TIMING] ⚠ {name} took {elapsed:.2f}s")
+        print(f"[TIMING] SLOW {name} took {elapsed:.2f}s")
     elif elapsed > 0.2:
         print(f"[TIMING] {name} took {elapsed:.2f}s")
+
+_provider_semaphores: dict[str, asyncio.Semaphore] = {}
+
+
+def _provider_semaphore(provider: str) -> asyncio.Semaphore:
+    key = (provider or "default").strip().lower() or "default"
+    semaphore = _provider_semaphores.get(key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(MAX_PROVIDER_CONCURRENCY)
+        _provider_semaphores[key] = semaphore
+    return semaphore
+
+
+def _pipe_provider_key(path: str, query: dict) -> str:
+    if path == "sources":
+        return str((query or {}).get("provider") or "sources")
+    if path == "episodes":
+        return "episode-index"
+    return str(path or "pipe")
 
 
 # ─── API Response Caching Helper ───────────────────────────────────────
@@ -461,6 +524,416 @@ async def _cached_response(prefix: str, ttl_seconds: int, fetch_fn, *key_parts):
                 await r.delete(lock_key)
             except Exception:
                 pass
+
+
+_presence_memory: dict[str, dict] = {}
+_presence_count_memory_cache: dict[str, Any] = {"data": None, "expires_at": 0}
+_bot_status_memory_cache: dict[str, Any] = {"data": None, "expires_at": 0}
+_maintenance_memory: dict[str, Any] = {
+    "enabled": False,
+    "reason": "",
+    "updatedBy": "",
+    "updatedAt": "",
+}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+ADS_STATUS_REDIS_KEY = "animio:ads:status"
+VALID_ADS_MODES = {"OFF", "SAFE", "BALANCED", "REVENUE"}
+
+
+def _default_ads_status() -> dict:
+    return {
+        "globalAdsEnabled": True,
+        "enabled": True,
+        "mode": "BALANCED",
+        "monetag": {
+            "enabled": True,
+            "watchPageEnabled": True,
+            "loadStrategy": "delayed",
+            "delaySeconds": 10,
+            "scriptId": "monetag-multitag-script",
+            "scriptUrl": "https://quge5.com/88/tag.min.js",
+            "zoneId": "245512",
+            "maxLoadsPerSession": 1,
+            "maxLoadsPerDay": 2,
+            "cooldownMinutes": 60,
+        },
+        "hilltopads": {
+            "enabled": False,
+            "futureProvider": True,
+            "vastEnabled": False,
+            "watchPageVastEnabled": False,
+            "popup": False,
+            "popunder": False,
+            "directLink": False,
+        },
+        "clickadu": {
+            "enabled": False,
+            "futureProvider": True,
+            "preRollEnabled": False,
+            "watchPagePreRollEnabled": False,
+            "popup": False,
+            "popunder": False,
+            "directLink": False,
+        },
+        "emergencyKillSwitch": {
+            "enabled": False,
+            "reason": "",
+        },
+        "reason": "Default balanced Monetag mode",
+        "updatedBy": "system",
+        "updatedAt": _utc_now_iso(),
+    }
+
+
+_ads_status_memory: dict[str, Any] = _default_ads_status()
+
+
+def _safe_ads_off_status(reason: str = "Ads status unavailable") -> dict:
+    status = _default_ads_status()
+    status.update({
+        "globalAdsEnabled": False,
+        "enabled": False,
+        "mode": "OFF",
+        "reason": reason,
+        "updatedBy": "system",
+        "updatedAt": _utc_now_iso(),
+    })
+    status["monetag"]["enabled"] = False
+    status["monetag"]["watchPageEnabled"] = False
+    status["emergencyKillSwitch"] = {"enabled": True, "reason": reason}
+    return status
+
+
+def _deep_merge_ads_status(existing: dict, update: dict) -> dict:
+    merged = deepcopy(existing if isinstance(existing, dict) else _default_ads_status())
+    if not isinstance(update, dict):
+        return merged
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_ads_status(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _normalize_ads_mode(mode: Any) -> str:
+    normalized = str(mode or "BALANCED").strip().upper()
+    if normalized not in VALID_ADS_MODES:
+        raise HTTPException(status_code=400, detail="Invalid ads mode")
+    return normalized
+
+
+def _validate_ads_status(status: dict) -> dict:
+    if not isinstance(status, dict):
+        raise HTTPException(status_code=400, detail="Invalid ads status")
+    normalized = _deep_merge_ads_status(_default_ads_status(), status)
+    normalized["mode"] = _normalize_ads_mode(normalized.get("mode"))
+    monetag = normalized.get("monetag") or {}
+    monetag["delaySeconds"] = max(0, int(monetag.get("delaySeconds", 10) or 0))
+    monetag["maxLoadsPerSession"] = max(1, int(monetag.get("maxLoadsPerSession", 1) or 1))
+    monetag["maxLoadsPerDay"] = max(0, int(monetag.get("maxLoadsPerDay", 2) or 0))
+    monetag["cooldownMinutes"] = max(0, int(monetag.get("cooldownMinutes", 60) or 0))
+    if monetag.get("loadStrategy") not in {"delayed", "interaction", "fast"}:
+        monetag["loadStrategy"] = "delayed"
+    normalized["monetag"] = monetag
+    return normalized
+
+
+async def _get_ads_status() -> dict:
+    global _ads_status_memory
+    r = await _get_redis()
+    if r:
+        try:
+            raw = await r.get(ADS_STATUS_REDIS_KEY)
+            if raw:
+                status = _validate_ads_status(json.loads(raw))
+                _ads_status_memory = status
+                return status
+        except Exception as exc:
+            print(f"[Ads] Redis read failed: {exc}")
+    return _validate_ads_status(_ads_status_memory)
+
+
+async def _update_ads_status(partial_update: dict) -> dict:
+    global _ads_status_memory
+    current = await _get_ads_status()
+    next_status = _deep_merge_ads_status(current, partial_update or {})
+    next_status["mode"] = _normalize_ads_mode(next_status.get("mode"))
+    next_status["updatedAt"] = (partial_update or {}).get("updatedAt") or _utc_now_iso()
+    next_status["updatedBy"] = (partial_update or {}).get("updatedBy") or "admin"
+    next_status = _validate_ads_status(next_status)
+    r = await _get_redis()
+    if r:
+        try:
+            await r.set(ADS_STATUS_REDIS_KEY, json.dumps(next_status, default=str))
+        except Exception as exc:
+            print(f"[Ads] Redis write failed: {exc}")
+    _ads_status_memory = next_status
+    return next_status
+
+
+def _ads_json_response(status: dict) -> JSONResponse:
+    return JSONResponse(
+        content=status,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+def _normalize_presence_id(value: str, field_name: str) -> str:
+    normalized = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,96}", normalized):
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}")
+    return normalized
+
+
+def _normalize_presence_page(value: str) -> str:
+    page = str(value or "/").strip()[:300] or "/"
+    if not page.startswith("/"):
+        page = f"/{page}"
+    return page
+
+
+def _presence_response(online: int, watching: int, api_status: str = "online") -> dict:
+    return {
+        "online": int(online or 0),
+        "watching": int(watching or 0),
+        "websiteStatus": "online",
+        "apiStatus": api_status,
+    }
+
+
+def _presence_prune_memory(now: Optional[float] = None) -> dict:
+    now = now or time.time()
+    cutoff = now - PRESENCE_TTL_SECONDS
+    expired = [tab_id for tab_id, entry in _presence_memory.items() if float(entry.get("updatedAt") or 0) < cutoff]
+    for tab_id in expired:
+        _presence_memory.pop(tab_id, None)
+    online_visitors = set()
+    watching_visitors = set()
+    for entry in _presence_memory.values():
+        visitor_id = entry.get("visitorId")
+        if not visitor_id:
+            continue
+        online_visitors.add(visitor_id)
+        if str(entry.get("page") or "").startswith("/watch"):
+            watching_visitors.add(visitor_id)
+    return _presence_response(len(online_visitors), len(watching_visitors), "degraded")
+
+
+async def _presence_count(use_cache: bool = True) -> dict:
+    now = time.time()
+    r = await _get_redis()
+    if r:
+        try:
+            if use_cache:
+                cached = await r.get(PRESENCE_COUNT_CACHE_KEY)
+                if cached:
+                    return json.loads(cached)
+
+            online_visitors = set()
+            watching_visitors = set()
+            async for key in r.scan_iter(match=f"{PRESENCE_TAB_PREFIX}:*", count=200):
+                raw = await r.get(key)
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except Exception:
+                    continue
+                visitor_id = entry.get("visitorId")
+                if not visitor_id:
+                    continue
+                online_visitors.add(visitor_id)
+                if str(entry.get("page") or "").startswith("/watch"):
+                    watching_visitors.add(visitor_id)
+
+            stats = _presence_response(len(online_visitors), len(watching_visitors), "online")
+            await r.setex(PRESENCE_COUNT_CACHE_KEY, PRESENCE_COUNT_CACHE_TTL, json.dumps(stats))
+            return stats
+        except Exception as exc:
+            print(f"[Presence] Redis count failed: {exc}")
+    if use_cache and _presence_count_memory_cache["data"] and _presence_count_memory_cache["expires_at"] > now:
+        return _presence_count_memory_cache["data"]
+    stats = _presence_prune_memory(now)
+    _presence_count_memory_cache["data"] = stats
+    _presence_count_memory_cache["expires_at"] = now + PRESENCE_COUNT_CACHE_TTL
+    return stats
+
+
+async def _presence_heartbeat(visitor_id: str, tab_id: str, page: str = "") -> dict:
+    visitor_id = _normalize_presence_id(visitor_id, "visitorId")
+    tab_id = _normalize_presence_id(tab_id, "tabId")
+    page = _normalize_presence_page(page)
+    now = time.time()
+    entry = {
+        "visitorId": visitor_id,
+        "page": page,
+        "updatedAt": int(now),
+    }
+    r = await _get_redis()
+    if r:
+        try:
+            key = f"{PRESENCE_TAB_PREFIX}:{tab_id}"
+            existing_raw = await r.get(key)
+            if existing_raw:
+                try:
+                    existing = json.loads(existing_raw)
+                    recent = now - float(existing.get("updatedAt") or 0) < 60
+                    same_page = existing.get("page") == page and existing.get("visitorId") == visitor_id
+                    if recent and same_page:
+                        await r.expire(key, PRESENCE_TTL_SECONDS)
+                        return {"ok": True}
+                except Exception:
+                    pass
+            await r.setex(key, PRESENCE_TTL_SECONDS, json.dumps(entry))
+            await r.delete(PRESENCE_COUNT_CACHE_KEY)
+            return {"ok": True}
+        except Exception as exc:
+            print(f"[Presence] Redis heartbeat failed: {exc}")
+    existing = _presence_memory.get(tab_id)
+    if existing:
+        recent = now - float(existing.get("updatedAt") or 0) < 60
+        same_page = existing.get("page") == page and existing.get("visitorId") == visitor_id
+        if recent and same_page:
+            return {"ok": True}
+    _presence_memory[tab_id] = entry
+    _presence_count_memory_cache["data"] = None
+    return {"ok": True}
+
+
+def _normalize_bot_status(data: Optional[dict], reachable: bool = True, error: Optional[str] = None) -> dict:
+    body = data if isinstance(data, dict) else {}
+    raw_status = str(body.get("status") or "").strip().lower()
+    online = bool(body.get("online")) or raw_status in {"online", "ready", "running", "connected", "ok"}
+    if not reachable:
+        online = False
+    status = "online" if online else "offline"
+    return {
+        "online": online,
+        "status": status,
+        "botName": body.get("botName") or body.get("name") or "Animio Bot",
+        "guildId": body.get("guildId") or body.get("guild_id"),
+        "updatedAt": body.get("updatedAt") or body.get("updated_at") or _utc_now_iso(),
+        **({"error": error or "Bot status unreachable"} if not reachable else {}),
+    }
+
+
+async def _fetch_discord_bot_status() -> dict:
+    now = time.time()
+    r = await _get_redis()
+    if r:
+        try:
+            cached = await r.get(BOT_STATUS_CACHE_KEY)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
+    elif _bot_status_memory_cache["data"] and _bot_status_memory_cache["expires_at"] > now:
+        return _bot_status_memory_cache["data"]
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            response = await client.get(DISCORD_BOT_STATUS_URL)
+            response.raise_for_status()
+            status = _normalize_bot_status(response.json(), reachable=True)
+    except Exception as exc:
+        status = _normalize_bot_status(None, reachable=False, error="Bot status unreachable")
+        print(f"[Bot Status] unreachable: {exc}")
+
+    if r:
+        try:
+            await r.setex(BOT_STATUS_CACHE_KEY, BOT_STATUS_CACHE_TTL, json.dumps(status, default=str))
+        except Exception:
+            pass
+    else:
+        _bot_status_memory_cache["data"] = status
+        _bot_status_memory_cache["expires_at"] = now + BOT_STATUS_CACHE_TTL
+    return status
+
+
+MAINTENANCE_ALLOWED_PATHS = {
+    "/maintenance/status",
+    "/admin/maintenance/on",
+    "/admin/maintenance/off",
+    "/admin/maintenance/status",
+    "/presence/count",
+    "/bot/status",
+    "/status/live",
+}
+
+
+def _maintenance_response(data: dict, public: bool = False) -> dict:
+    payload = {
+        "enabled": bool(data.get("enabled")),
+        "reason": data.get("reason") or "",
+        "updatedAt": data.get("updatedAt") or "",
+    }
+    if not public:
+        payload["updatedBy"] = data.get("updatedBy") or ""
+    return payload
+
+
+async def _get_maintenance_state() -> dict:
+    r = await _get_redis()
+    if r:
+        try:
+            values = await r.mget(
+                "maintenance:enabled",
+                "maintenance:reason",
+                "maintenance:updated_at",
+                "maintenance:updated_by",
+            )
+            enabled_raw, reason, updated_at, updated_by = values
+            return {
+                "enabled": str(enabled_raw or "").strip().lower() in {"1", "true", "yes", "on"},
+                "reason": reason or "",
+                "updatedAt": updated_at or "",
+                "updatedBy": updated_by or "",
+            }
+        except Exception as exc:
+            print(f"[Maintenance] Redis read failed: {exc}")
+    return dict(_maintenance_memory)
+
+
+async def _set_maintenance_state(enabled: bool, reason: str = "", updated_by: str = "") -> dict:
+    updated_at = _utc_now_iso()
+    state = {
+        "enabled": bool(enabled),
+        "reason": str(reason or "").strip()[:500],
+        "updatedAt": updated_at,
+        "updatedBy": str(updated_by or "").strip()[:160],
+    }
+    r = await _get_redis()
+    if r:
+        try:
+            pipe = r.pipeline()
+            pipe.set("maintenance:enabled", "1" if enabled else "0")
+            pipe.set("maintenance:reason", state["reason"])
+            pipe.set("maintenance:updated_at", state["updatedAt"])
+            pipe.set("maintenance:updated_by", state["updatedBy"])
+            await pipe.execute()
+        except Exception as exc:
+            print(f"[Maintenance] Redis write failed: {exc}")
+    _maintenance_memory.update(state)
+    return state
+
+
+def _maintenance_allowed(path: str) -> bool:
+    return (
+        path in MAINTENANCE_ALLOWED_PATHS
+        or path.startswith("/health")
+        or path.startswith("/docs")
+        or path.startswith("/redoc")
+        or path == "/openapi.json"
+    )
 
 
 def _save_local_manga_mappings():
@@ -711,6 +1184,224 @@ def _episode_list_total(eps_list: list) -> int:
     return max_num
 
 
+def _episode_list_range(eps_list: list, start: int, limit: int) -> list:
+    if not isinstance(eps_list, list):
+        return []
+    end = start + limit - 1
+    numeric_items = []
+    non_numeric_items = []
+    for ep in eps_list:
+        number = _episode_number_int(ep) if isinstance(ep, dict) else None
+        if number is None:
+            non_numeric_items.append(ep)
+        elif start <= number <= end:
+            numeric_items.append(ep)
+    if numeric_items:
+        return numeric_items
+    return eps_list[max(0, start - 1):start - 1 + limit]
+
+
+def _episode_number_int(ep: dict) -> Optional[int]:
+    try:
+        return int(float(ep.get("number")))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _provider_episode_numbers(provider_data: dict, category: str = "sub") -> list[int]:
+    if not isinstance(provider_data, dict):
+        return []
+    episodes = provider_data.get("episodes")
+    if isinstance(episodes, list):
+        episode_list = episodes if category == "sub" else []
+    elif isinstance(episodes, dict):
+        episode_list = episodes.get(category, [])
+    else:
+        episode_list = []
+    nums = []
+    for ep in episode_list if isinstance(episode_list, list) else []:
+        number = _episode_number_int(ep)
+        if number is not None:
+            nums.append(number)
+    return sorted(set(nums))
+
+
+def _provider_episode_map(provider_data: dict, category: str = "sub") -> dict[int, dict]:
+    if not isinstance(provider_data, dict):
+        return {}
+    episodes = provider_data.get("episodes")
+    if isinstance(episodes, list):
+        episode_list = episodes if category == "sub" else []
+    elif isinstance(episodes, dict):
+        episode_list = episodes.get(category, [])
+    else:
+        episode_list = []
+    mapped = {}
+    for ep in episode_list if isinstance(episode_list, list) else []:
+        if not isinstance(ep, dict):
+            continue
+        number = _episode_number_int(ep)
+        if number is not None and number not in mapped:
+            mapped[number] = ep
+    return mapped
+
+
+def _missing_numbers_between(existing: set[int], expected_max: int, start: int = 1) -> list[int]:
+    if expected_max <= 0 or start > expected_max:
+        return []
+    return [number for number in range(start, expected_max + 1) if number not in existing]
+
+
+async def _episode_integrity_context(anilist_id: int) -> dict:
+    async def fetch_fn():
+        gql = """
+        query ($id: Int) {
+          Media(id: $id, type: ANIME) {
+            id
+            status
+            episodes
+            title { romaji english native }
+            nextAiringEpisode { episode airingAt }
+          }
+        }
+        """
+        data = await _anilist_query(gql, {"id": anilist_id})
+        media = data.get("Media") or {}
+        title = media.get("title") or {}
+        return {
+            "title": title.get("english") or title.get("romaji") or title.get("native") or str(anilist_id),
+            "status": media.get("status"),
+            "episodes": media.get("episodes"),
+            "nextEpisode": (media.get("nextAiringEpisode") or {}).get("episode"),
+            "nextAiringAt": (media.get("nextAiringEpisode") or {}).get("airingAt"),
+        }
+
+    try:
+        return await _cached_response("episode_integrity_meta:v1", 1800, fetch_fn, str(anilist_id))
+    except Exception as exc:
+        print(f"[Episode Integrity] id={anilist_id} status=meta_unavailable error={exc}")
+        return {"title": str(anilist_id)}
+
+
+def _expected_released_episode(context: dict) -> int:
+    next_episode = context.get("nextEpisode") if isinstance(context, dict) else None
+    if isinstance(next_episode, int) and next_episode > 1:
+        return next_episode - 1
+    total = context.get("episodes") if isinstance(context, dict) else None
+    status = str(context.get("status") or "").upper() if isinstance(context, dict) else ""
+    if status == "FINISHED" and isinstance(total, int) and total > 0:
+        return total
+    return 0
+
+
+def _primary_needs_episode_fallback(anizone_data: Optional[dict], context: dict, start: int = 1, limit: int = 100) -> tuple[bool, list[int], dict]:
+    providers = anizone_data.get("providers", {}) if isinstance(anizone_data, dict) else {}
+    primary_data = providers.get(PRIMARY_STREAM_PROVIDER) or providers.get("anizone") or {}
+    primary_numbers = _provider_episode_numbers(primary_data)
+    primary_max = max(primary_numbers) if primary_numbers else 0
+    primary_total = int(anizone_data.get("_anizoneTotalKnown") or 0) if isinstance(anizone_data, dict) else 0
+    primary_has_more = bool(anizone_data.get("_anizoneHasMore")) if isinstance(anizone_data, dict) else False
+    expected_max = _expected_released_episode(context)
+    range_end = start + limit - 1
+    comparable_max = min(range_end, max(primary_max, expected_max if start <= expected_max <= range_end else 0))
+    missing = _missing_numbers_between(set(primary_numbers), comparable_max, start)
+    finite_primary = bool(primary_numbers) and not primary_has_more
+    has_range_gap = finite_primary and any(number < primary_max for number in missing)
+    expected_missing_now = start <= expected_max <= range_end and expected_max > max(primary_max, primary_total)
+    needs_fallback = not primary_numbers or has_range_gap or expected_missing_now
+    summary = {
+        "primary": PRIMARY_STREAM_PROVIDER or "anizone",
+        "count": len(primary_numbers),
+        "max": primary_max,
+        "total": primary_total,
+        "hasMore": primary_has_more,
+        "expectedMax": expected_max,
+        "missing": missing,
+    }
+    return needs_fallback, missing, summary
+
+
+def _apply_episode_integrity(result: dict, anilist_id: int, context: dict, warnings: list[str], start: int = 1, limit: int = 100) -> dict:
+    if not isinstance(result, dict):
+        return result
+    providers = result.get("providers")
+    if not isinstance(providers, dict):
+        return result
+
+    ordered_provider_names = _provider_resolver.order(providers.keys())
+    primary_name = PRIMARY_STREAM_PROVIDER if PRIMARY_STREAM_PROVIDER in providers else "anizone"
+    primary_data = providers.get(primary_name) or {}
+    primary_map = _provider_episode_map(primary_data, "sub")
+    primary_numbers = sorted(primary_map)
+    primary_max = max(primary_numbers) if primary_numbers else 0
+    expected_max = _expected_released_episode(context)
+
+    provider_summaries = []
+    backup_maps = []
+    backup_max = 0
+    for priority, provider_name in enumerate(ordered_provider_names, start=1):
+        provider_data = providers.get(provider_name) or {}
+        numbers = _provider_episode_numbers(provider_data, "sub")
+        if numbers:
+            provider_summaries.append((provider_name, len(numbers), max(numbers)))
+            backup_max = max(backup_max, max(numbers))
+        if provider_name != primary_name:
+            backup_maps.append((provider_name, priority, _provider_episode_map(provider_data, "sub")))
+
+    range_end = start + limit - 1
+    target_max = min(range_end, max(primary_max, expected_max if start <= expected_max <= range_end else 0, backup_max))
+    missing_from_primary = _missing_numbers_between(set(primary_numbers), target_max, start)
+    merged_by_number = dict(primary_map)
+    fallback_added = 0
+
+    for number in missing_from_primary:
+        for provider_name, priority, episode_map in backup_maps:
+            fallback_episode = episode_map.get(number)
+            if not fallback_episode:
+                continue
+            merged_episode = dict(fallback_episode)
+            merged_episode["provider"] = provider_name
+            merged_episode["sourceProvider"] = provider_name
+            merged_episode["providerPriority"] = priority
+            merged_episode["isFallbackEpisode"] = True
+            merged_by_number[number] = merged_episode
+            fallback_added += 1
+            break
+
+    merged = [merged_by_number[number] for number in sorted(merged_by_number)]
+    if merged:
+        current_episodes = result.get("episodes") if isinstance(result.get("episodes"), dict) else {}
+        result["episodes"] = {"sub": merged, "dub": current_episodes.get("dub", []) if isinstance(current_episodes.get("dub"), list) else []}
+        result["episodeIntegrity"] = {
+            "primary": primary_name,
+            "primaryCount": len(primary_numbers),
+            "primaryMax": primary_max,
+            "expectedMax": expected_max,
+            "backupMax": backup_max,
+            "missingFromPrimary": missing_from_primary,
+            "fallbackAdded": fallback_added,
+        }
+
+    title = _safe_log_value((context or {}).get("title") or str(anilist_id))
+    range_end = start + limit - 1
+    print(f"[Episode Integrity] title={title} id={anilist_id}")
+    print(f"[Episode Integrity] range={start}-{range_end}")
+    print(f"[Episode Integrity] primary={primary_name} count={len(primary_numbers)} max={primary_max}")
+    for provider_name, count, max_number in provider_summaries:
+        if provider_name != primary_name:
+            print(f"[Episode Integrity] backup={provider_name} count={count} max={max_number}")
+    if fallback_added:
+        print(f"[Episode Integrity] missingFromPrimary={missing_from_primary}")
+        print(f"[Episode Integrity] merged count={len(merged)} fallbackAdded={fallback_added}")
+        warnings.append(f"episode integrity fallback added {fallback_added} missing primary episode(s)")
+    elif missing_from_primary and backup_maps:
+        print("[Episode Integrity] backup providers checked but no missing episodes found")
+        print("[Episode Integrity] returning primary result")
+    else:
+        print("[Episode Integrity] status=ok no fallback needed")
+    return result
+
+
 def _slice_episode_data(data: dict, start: int, limit: int) -> dict:
     """Slice each provider's episode list to [start, start+limit) and add metadata.
     Uses Anizone totalKnown/hasMore as fallback when miruro providers are not available."""
@@ -736,9 +1427,11 @@ def _slice_episode_data(data: dict, start: int, limit: int) -> dict:
             if not isinstance(lst, list):
                 sliced_eps[lang] = []
                 continue
-            total_from_lists = max(total_from_lists, len(lst))
-            max_ep_num = max(max_ep_num, _episode_list_total(lst))
-            sliced_eps[lang] = lst[max(0, start - 1):start - 1 + limit]
+            list_max_ep = _episode_list_total(lst)
+            max_ep_num = max(max_ep_num, list_max_ep)
+            if list_max_ep <= 0:
+                total_from_lists = max(total_from_lists, len(lst))
+            sliced_eps[lang] = _episode_list_range(lst, start, limit)
         prov_data["episodes"] = sliced_eps
 
     # Slice top-level episodes
@@ -747,7 +1440,7 @@ def _slice_episode_data(data: dict, start: int, limit: int) -> dict:
         for lang in ("sub", "dub"):
             lst = top_eps.get(lang, [])
             if isinstance(lst, list):
-                top_eps[lang] = lst[max(0, start - 1):start - 1 + limit]
+                top_eps[lang] = _episode_list_range(lst, start, limit)
 
     end = start + limit - 1
     # Use best available total: miruro list lengths > anizone metadata > ep numbers
@@ -1006,8 +1699,11 @@ async def _fetch_pipe(path: str, query: dict, translate_ids: bool = True) -> dic
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
+    timeout = PER_PROVIDER_SOURCE_TIMEOUT_SECONDS if path == "sources" else 15.0
+    provider_key = _pipe_provider_key(path, query)
+    async with _provider_semaphore(provider_key):
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
         if res.status_code != 200:
             raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
         data = _decode_pipe_response(res.text.strip())
@@ -1070,6 +1766,30 @@ async def _try_episode_fetch(query: dict):
         return None, exc
     except Exception as exc:
         return None, exc
+
+
+async def _backup_episodes_cached(anilist_id: int, start: int = 1, limit: int = 100):
+    return await _provider_episode_index_cached(anilist_id)
+
+
+async def _provider_episode_index_cached(anilist_id: int):
+    async def fetch_fn():
+        raw_data, error = await asyncio.wait_for(
+            _try_episode_fetch({"anilistId": anilist_id}),
+            timeout=EPISODE_INDEX_TIMEOUT_SECONDS,
+        )
+        if raw_data is not None:
+            raw_data = _inject_source_slugs(raw_data, anilist_id)
+            provider_count = len((raw_data.get("providers") or {}) if isinstance(raw_data, dict) else {})
+            print(f"[Episode Index] id={anilist_id} providers={provider_count} source=miruro")
+            return {"data": raw_data, "error": None}
+        return {"data": None, "error": str(error) if error else "No streaming episodes found"}
+
+    try:
+        cached = await _cached_response("provider_episode_index:v2", EPISODE_INDEX_CACHE_TTL, fetch_fn, "miruro", str(anilist_id))
+    except asyncio.TimeoutError:
+        return None, f"miruro episode index timed out after {EPISODE_INDEX_TIMEOUT_SECONDS}s"
+    return cached.get("data"), cached.get("error")
 
 
 async def _try_source_fetch(episode_id: str, provider: str, category: str, anime_query: dict):
@@ -4282,6 +5002,107 @@ async def get_home_data():
     return await _cached_response("home:v2", HOME_CACHE_TTL, fetch_fn, "latest-v2")
 
 
+@app.post("/presence/heartbeat")
+async def presence_heartbeat(request: Request):
+    """Refresh an anonymous tab heartbeat and return live site presence stats."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    visitor_id = payload.get("visitorId")
+    tab_id = payload.get("tabId")
+    page = payload.get("page") or "/"
+    return await _presence_heartbeat(visitor_id, tab_id, page=page)
+
+
+@app.get("/presence/count")
+async def presence_count():
+    """Return live anonymous site presence stats."""
+    return await _presence_count()
+
+
+@app.get("/bot/status")
+async def bot_status():
+    """Backend proxy for Discord bot status to avoid frontend mixed-content requests."""
+    return await _fetch_discord_bot_status()
+
+
+@app.get("/status/live")
+async def live_status():
+    """Return website presence and Discord bot status together."""
+    presence, discord_bot = await asyncio.gather(
+        _presence_count(),
+        _fetch_discord_bot_status(),
+    )
+    return {**presence, "discordBot": discord_bot}
+
+
+@app.get("/api/ads/status")
+async def public_ads_status():
+    """Public frontend ad status. Fails closed if status storage is unavailable."""
+    try:
+        return _ads_json_response(await _get_ads_status())
+    except Exception as exc:
+        print(f"[Ads] Public status fallback OFF: {exc}")
+        return _ads_json_response(_safe_ads_off_status())
+
+
+@app.get("/admin/ads/status")
+async def admin_ads_status(request: Request):
+    if not _has_valid_api_key(request):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return _ads_json_response(await _get_ads_status())
+
+
+@app.post("/admin/ads/status")
+async def admin_update_ads_status(request: Request):
+    if not _has_valid_api_key(request):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid update payload")
+    return _ads_json_response(await _update_ads_status(payload))
+
+
+@app.post("/admin/maintenance/on")
+async def admin_maintenance_on(request: Request):
+    if not _has_valid_api_key(request):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    state = await _set_maintenance_state(
+        True,
+        reason=payload.get("reason") or "Animio is currently under maintenance.",
+        updated_by=payload.get("updatedBy") or "admin",
+    )
+    return _maintenance_response(state)
+
+
+@app.post("/admin/maintenance/off")
+async def admin_maintenance_off(request: Request):
+    if not _has_valid_api_key(request):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    state = await _set_maintenance_state(False)
+    return _maintenance_response(state)
+
+
+@app.get("/admin/maintenance/status")
+async def admin_maintenance_status(request: Request):
+    if not _has_valid_api_key(request):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return _maintenance_response(await _get_maintenance_state())
+
+
+@app.get("/maintenance/status")
+async def maintenance_status():
+    return _maintenance_response(await _get_maintenance_state(), public=True)
+
+
 @app.get("/schedule")
 async def get_schedule(
     page: int = Query(1, ge=1),
@@ -4591,14 +5412,16 @@ async def _anizone_search_cached(query: str) -> dict:
     return await _cached_response("anizone_search", ANIZONE_CACHE_SEARCH_TTL, fetch_fn, query.strip().lower())
 
 
-async def _anizone_episodes_cached(anime_url: str, start: int = 1, limit: int = 100) -> dict:
+async def _anizone_episodes_cached(anime_url: str, anilist_id: Optional[int] = None, start: int = 1, limit: int = 100) -> dict:
     normalized_url = normalize_anizone_url(anime_url)
 
     async def fetch_fn():
-        episodes, total_known, has_more = await _anizone_provider.get_episodes(normalized_url, start=start, limit=limit)
+        async with _provider_semaphore("anizone"):
+            episodes, total_known, has_more = await _anizone_provider.get_episodes(normalized_url, start=start, limit=limit)
         return {"episodes": episodes, "totalKnown": total_known, "hasMore": has_more}
 
-    return await _cached_response("anizone_episodes:v3", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, normalized_url, str(start), str(limit))
+    cache_id = str(anilist_id) if anilist_id is not None else normalized_url
+    return await _cached_response("provider_episodes:v1", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, "anizone", cache_id, str(start), str(limit))
 
 
 async def _anizone_sources_cached(episode_url: str) -> dict:
@@ -4716,7 +5539,7 @@ async def _inject_anizone_provider(data: dict, anilist_id: int, start: int = 1, 
         match = await _find_anizone_match(anilist_id)
         if not match:
             return data
-        episodes_data = await _anizone_episodes_cached(match["id"], start=start, limit=limit)
+        episodes_data = await _anizone_episodes_cached(match["id"], anilist_id=anilist_id, start=start, limit=limit)
         episodes = episodes_data.get("episodes") or []
         if not episodes:
             print(f"[Anizone] fallback reason=no_episodes anilistId={anilist_id}")
@@ -4746,7 +5569,11 @@ async def get_episodes_by_mal_slug(mal_id: int):
         "anilistId": backup["anilistId"],
     }
     data = await _inject_anizone_provider(data, backup["anilistId"])
-    return _proxy_deep_images(_order_stream_providers(_remove_disabled_stream_providers(_inject_mal_source_slugs(data, mal_id))))
+    data = _inject_mal_source_slugs(data, mal_id)
+    data = _merge_anizone_and_miruro_episodes(backup["anilistId"], data, data, data.get("warnings", []))
+    context = await _episode_integrity_context(backup["anilistId"])
+    data = _apply_episode_integrity(data, backup["anilistId"], context, data.get("warnings", []), start=1, limit=500)
+    return _proxy_deep_images(_order_stream_providers(_remove_disabled_stream_providers(data)))
 
 
 @app.get("/episodes/{anilist_id}")
@@ -4771,23 +5598,43 @@ async def get_episodes(
         warnings = []
         anizone_data = None
         miruro_data = None
+        integrity_context = await _episode_integrity_context(anilist_id)
 
         # 1. Fetch Anizone episodes (soft fail) — only fetches pages needed for range
         try:
-            anizone_data = await _inject_anizone_provider({"providers": {}}, anilist_id, start=start, limit=limit)
+            anizone_data = await asyncio.wait_for(
+                _inject_anizone_provider({"providers": {}}, anilist_id, start=start, limit=limit),
+                timeout=EPISODE_INDEX_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            warnings.append(f"anizone lookup timed out after {EPISODE_INDEX_TIMEOUT_SECONDS}s")
         except Exception as exc:
             warnings.append(f"anizone lookup failed: {exc}")
 
-        # 2. Fetch Miruro pipe for backup providers (soft fail, always)
-        try:
-            raw_miruro, miruro_error = await _try_episode_fetch({"anilistId": anilist_id})
-            if raw_miruro is not None:
-                miruro_data = _inject_source_slugs(raw_miruro, anilist_id)
-        except Exception as exc:
-            warnings.append(f"miruro episode fetch failed: {exc}")
+        needs_fallback, primary_missing, primary_summary = _primary_needs_episode_fallback(anizone_data, integrity_context, start=start, limit=limit)
+        needs_fallback = True
+        if needs_fallback:
+            print(
+                f"[Episode Index] id={anilist_id} range={start}-{start + limit - 1} primary={primary_summary.get('primary')} "
+                f"count={primary_summary.get('count')} max={primary_summary.get('max')} "
+                f"total={primary_summary.get('total')} expectedMax={primary_summary.get('expectedMax')} "
+                f"missing={primary_missing} action=fetch_provider_index"
+            )
+            print("[Episode Index] checking cached provider episode indexes...")
+
+            # 2. Fetch Miruro pipe for backup providers only when primary looks incomplete.
+            try:
+                raw_miruro, miruro_error = await _provider_episode_index_cached(anilist_id)
+                if raw_miruro is not None:
+                    miruro_data = raw_miruro
+                elif miruro_error:
+                    warnings.append(f"provider episode index unavailable: {miruro_error}")
+            except Exception as exc:
+                warnings.append(f"provider episode index failed: {exc}")
 
         # 3. Merge Anizone + Miruro providers
         result = _merge_anizone_and_miruro_episodes(anilist_id, anizone_data, miruro_data, warnings)
+        result = _apply_episode_integrity(result, anilist_id, integrity_context, warnings, start=start, limit=limit)
 
         # 4. If no providers from either source, try AnimeKai + MAL fallbacks
         has_any_providers = bool(result.get("providers"))
@@ -4809,6 +5656,7 @@ async def get_episodes(
                     _inject_source_slugs(animekai_only, anilist_id),
                     warnings,
                 )
+                result = _apply_episode_integrity(result, anilist_id, integrity_context, warnings, start=start, limit=limit)
                 has_any_providers = bool(result.get("providers"))
 
         if not has_any_providers and malId is not None:
@@ -4830,6 +5678,7 @@ async def get_episodes(
                     _inject_mal_source_slugs(data, malId),
                     warnings,
                 )
+                result = _apply_episode_integrity(result, anilist_id, integrity_context, warnings, start=start, limit=limit)
             except Exception as exc:
                 warnings.append(f"mal backup failed: {exc}")
 
@@ -4838,10 +5687,13 @@ async def get_episodes(
         result["warnings"] = warnings
         return result
 
-    full_data = await _cached_response("episodes:v4", 43200, fetch_fn, str(anilist_id), str(start), str(limit))
+    async def integrity_fetch_fn():
+        return await _cached_response("episode_integrity:v2", 43200, fetch_fn, str(anilist_id), str(start), str(limit))
+
+    full_data = await _cached_response("episodes:v7", 43200, integrity_fetch_fn, str(anilist_id), str(start), str(limit))
     sliced = _slice_episode_data(full_data, start, limit)
     ordered = _order_stream_providers(_remove_disabled_stream_providers(sliced))
-    if int(anilist_id) == 202957:
+    if str(anilist_id) in DEBUG_EPISODE_ANIME_IDS:
         debug_summary = {}
         for provider_name, provider_data in (ordered.get("providers") or {}).items():
             episodes = provider_data.get("episodes", {}) if isinstance(provider_data, dict) else {}
@@ -4853,7 +5705,7 @@ async def get_episodes(
                 except (TypeError, ValueError, AttributeError):
                     continue
             debug_summary[provider_name] = sorted(set(nums))
-        print(f"[Episodes Debug] title=Star Detective anilist_id={anilist_id} providers={debug_summary}")
+        print(f"[Episodes Debug] anilist_id={anilist_id} providers={debug_summary}")
     return ordered
 
 
