@@ -3711,6 +3711,7 @@ async def get_manga_chapters(
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=500),
     order: str = Query("asc", description="asc or desc"),
+    readableOnly: bool = Query(True, description="Only return chapters with hosted MangaDex page images"),
 ):
     """Get MangaDex chapters for a manga in one language."""
     order = "desc" if order.lower() == "desc" else "asc"
@@ -3723,10 +3724,11 @@ async def get_manga_chapters(
     ]
     params += _mangadex_array_params("translatedLanguage", _split_csv(lang, ["en"]))
     params += _mangadex_array_params("includes", ["scanlation_group"])
-    cache_key = f"{manga_id}:{lang}:{page}:{per_page}:{order}"
+    cache_key = f"{manga_id}:{lang}:{page}:{per_page}:{order}:readableOnly={readableOnly}"
     payload = await _mangadex_get(f"/manga/{manga_id}/feed", params=params, cache_type="manga_chapters", cache_key=cache_key, ttl_hours=0.5)
-    chapters = [_normalize_mangadex_chapter(item) for item in payload.get("data", [])]
-    total = payload.get("total", 0)
+    normalized_chapters = [_normalize_mangadex_chapter(item) for item in payload.get("data", [])]
+    chapters = [chapter for chapter in normalized_chapters if chapter.get("readable")] if readableOnly else normalized_chapters
+    total = len(chapters) if readableOnly else payload.get("total", 0)
     return _proxy_deep_images({
         "mangaId": manga_id,
         "source": "mangadex",
@@ -3734,7 +3736,8 @@ async def get_manga_chapters(
         "page": page,
         "perPage": per_page,
         "total": total,
-        "hasNextPage": (page * per_page) < total,
+        "hasNextPage": (page * per_page) < payload.get("total", 0),
+        "readableOnly": readableOnly,
         "chapters": chapters,
     })
 
