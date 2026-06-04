@@ -862,6 +862,7 @@ async def _fetch_discord_bot_status() -> dict:
 MAINTENANCE_ALLOWED_PATHS = {
     "/maintenance/status",
     "/admin/maintenance/on",
+    "/presence/heartbeat",
     "/admin/maintenance/off",
     "/admin/maintenance/status",
     "/presence/count",
@@ -5005,16 +5006,19 @@ async def get_home_data():
     return await _cached_response("home:v2", HOME_CACHE_TTL, fetch_fn, "latest-v2")
 
 
-@app.post("/presence/heartbeat")
+@app.api_route("/presence/heartbeat", methods=["GET", "POST"])
 async def presence_heartbeat(request: Request):
     """Refresh an anonymous tab heartbeat and return live site presence stats."""
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    visitor_id = payload.get("visitorId")
-    tab_id = payload.get("tabId")
-    page = payload.get("page") or "/"
+    payload = {}
+    if request.method == "POST":
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    query = request.query_params
+    visitor_id = payload.get("visitorId") or query.get("visitorId")
+    tab_id = payload.get("tabId") or query.get("tabId") or visitor_id
+    page = payload.get("page") or query.get("page") or "/"
     return await _presence_heartbeat(visitor_id, tab_id, page=page)
 
 
