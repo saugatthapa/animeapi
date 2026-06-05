@@ -5416,7 +5416,7 @@ async def _anizone_search_cached(query: str) -> dict:
     async def fetch_fn():
         return {"results": await _anizone_provider.search(query)}
 
-    return await _cached_response("anizone_search", ANIZONE_CACHE_SEARCH_TTL, fetch_fn, query.strip().lower())
+    return await _cached_response("anizone_search:v2", ANIZONE_CACHE_SEARCH_TTL, fetch_fn, query.strip().lower())
 
 
 async def _anizone_episodes_cached(anime_url: str, anilist_id: Optional[int] = None, start: int = 1, limit: int = 100) -> dict:
@@ -5428,7 +5428,7 @@ async def _anizone_episodes_cached(anime_url: str, anilist_id: Optional[int] = N
         return {"episodes": episodes, "totalKnown": total_known, "hasMore": has_more}
 
     cache_id = str(anilist_id) if anilist_id is not None else normalized_url
-    return await _cached_response("provider_episodes:v1", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, "anizone", cache_id, str(start), str(limit))
+    return await _cached_response("provider_episodes:v2", ANIZONE_CACHE_EPISODES_TTL, fetch_fn, "anizone", cache_id, str(start), str(limit))
 
 
 async def _anizone_sources_cached(episode_url: str) -> dict:
@@ -5520,6 +5520,9 @@ async def _find_anizone_match(anilist_id: int) -> Optional[dict]:
             try:
                 search_data = await _anizone_search_cached(title)
                 for candidate in search_data.get("results", []):
+                    candidate_path = urlparse(str(candidate.get("id") or "")).path
+                    if not candidate_path.startswith("/anime/"):
+                        continue
                     score = _score_anizone_match(candidate, titles, info.get("year"), info.get("episodes"))
                     if score > best_score:
                         best = candidate
@@ -5535,8 +5538,14 @@ async def _find_anizone_match(anilist_id: int) -> Optional[dict]:
         print(f"[Anizone] match anilistId={anilist_id} title={_safe_log_value(best.get('title'))} score={best_score}")
         return {"match": best, "score": best_score}
 
-    cached = await _cached_response("anizone_match", ANIZONE_CACHE_MATCH_TTL, fetch_fn, str(anilist_id), title_hash)
-    return cached.get("match")
+    cached = await _cached_response("anizone_match:v2", ANIZONE_CACHE_MATCH_TTL, fetch_fn, str(anilist_id), title_hash)
+    match = cached.get("match")
+    if isinstance(match, dict):
+        match_path = urlparse(str(match.get("id") or "")).path
+        if match_path.startswith("/anime/"):
+            return match
+        print(f"[Anizone] fallback reason=invalid_cached_match anilistId={anilist_id} id={_safe_log_value(match.get('id'))}")
+    return None
 
 
 async def _inject_anizone_provider(data: dict, anilist_id: int, start: int = 1, limit: int = 100) -> dict:

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import os
 import re
 import time
@@ -112,6 +113,37 @@ def _episode_sort_key(item: dict):
         return (1, str(item.get("number") or item.get("title") or ""))
 
 
+def _extract_alpine_titles(element) -> dict:
+    raw_data = element.get("x-data") if element is not None else ""
+    if not raw_data:
+        return {}
+    match = re.search(r"anmTitles:\s*JSON\.parse\('((?:\\.|[^'])*)'\)", raw_data)
+    if not match:
+        return {}
+    try:
+        json_text = json.loads(f'"{match.group(1)}"')
+        titles = json.loads(json_text)
+        return titles if isinstance(titles, dict) else {}
+    except Exception:
+        return {}
+
+
+def _best_anizone_title(element, fallback: str = "") -> str:
+    titles = _extract_alpine_titles(element)
+    for key in ("5", "8", "1", "42"):
+        value = titles.get(key)
+        if value:
+            return str(value).strip()
+    for value in titles.values():
+        if value:
+            return str(value).strip()
+    return (fallback or "").strip()
+
+
+def _anime_path_depth(path: str) -> int:
+    return len([part for part in (path or "").split("/") if part])
+
+
 class AnizoneProvider:
     name = "anizone"
     display_name = "Anizone"
@@ -136,11 +168,14 @@ class AnizoneProvider:
 
         results = []
         for item in soup.select("div.grid > div.relative.overflow-hidden"):
-            title_node = item.select_one("a[title]")
+            title_node = item.select_one('a[href*="/anime/"]')
             if title_node is None:
                 continue
             href = title_node.get("href") or ""
-            title = (title_node.get("title") or safe_text(title_node)).strip()
+            parsed_path = urlparse(absolute_url(href)).path
+            if not parsed_path.startswith("/anime/") or _anime_path_depth(parsed_path) != 2:
+                continue
+            title = _best_anizone_title(item, title_node.get("title") or safe_text(title_node))
             if not href or not title:
                 continue
             info = safe_text(item.select_one(".text-xs"))
@@ -174,16 +209,22 @@ class AnizoneProvider:
                 timeout=ANIZONE_EPISODES_TIMEOUT_SECONDS + 1,
             )
 
+        anime_path = urlparse(normalized_url).path.rstrip("/")
         while page <= max_pages:
             soup = await fetch_page(page)
 
-            candidates = list(soup.select("ul.grid li a"))
+            candidates = [
+                element
+                for element in soup.select("ul.grid li a[href]")
+                if urlparse(absolute_url(element.get("href") or "")).path.startswith(f"{anime_path}/")
+                and safe_text(element).lower().startswith("episode")
+            ]
             if not candidates:
-                anime_path = urlparse(normalized_url).path.rstrip("/")
                 candidates = [
                     element
                     for element in soup.select("a[href]")
                     if urlparse(absolute_url(element.get("href") or "")).path.startswith(f"{anime_path}/")
+                    and safe_text(element).lower().startswith("episode")
                 ]
 
             if not candidates:
@@ -224,11 +265,11 @@ class AnizoneProvider:
                     next_soup = await fetch_page(page + 1)
                     next_candidates = list(next_soup.select("ul.grid li a"))
                     if not next_candidates:
-                        anime_path = urlparse(normalized_url).path.rstrip("/")
                         next_candidates = [
                             element
                             for element in next_soup.select("a[href]")
                             if urlparse(absolute_url(element.get("href") or "")).path.startswith(f"{anime_path}/")
+                            and safe_text(element).lower().startswith("episode")
                         ]
                     has_more = len(next_candidates) > 0
                 except Exception:
