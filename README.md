@@ -39,7 +39,7 @@ This API supports two access patterns:
 Environment variables:
 
 ```txt
-ALLOWED_ORIGINS=http://localhost:3000,https://ani-vanta.vercel.app,https://anizen.saugatthapa43.workers.dev
+ALLOWED_ORIGINS=https://animio.co,https://www.animio.co,https://animio.qzz.io,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173
 API_KEY=your-secret-key
 ALLOW_API_KEY_ANY_ORIGIN=1
 ```

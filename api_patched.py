@@ -107,20 +107,8 @@ _api._inject_extra_stream_providers = _safe_noop_extra_stream_provider_injection
 
 
 async def safe_get_episodes_by_mal_slug(mal_id: int):
-    """Fast MAL episode route without AnimeKai/AniZone injection."""
-    backup = await _api._fetch_mal_backup_episode_data(mal_id)
-    if "response" in backup:
-        return backup["response"]
-
-    data = backup["data"]
-    data["malBackup"] = {
-        "used": True,
-        "malId": mal_id,
-        "source": backup["source"],
-        "anilistId": backup["anilistId"],
-    }
-    data = await _api._inject_anizone_provider(data, backup["anilistId"])
-    return _api._proxy_deep_images(_api._order_stream_providers(_api._inject_mal_source_slugs(data, mal_id)))
+    """Use the main MAL route so global episode integrity/fallback stays consistent."""
+    return await _api.get_episodes_by_mal_slug(mal_id)
 
 
 async def safe_get_episodes_by_mal(malId: int):

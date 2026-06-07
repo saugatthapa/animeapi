@@ -183,7 +183,7 @@ async def aget_or_set_cache(prefix: str, ttl_seconds: int, fetch_fn: Callable, *
 # --- Security Configuration ---
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:3000,https://animio.qzz.io,https://ani-vanta.vercel.app,https://anizen.saugatthapa43.workers.dev",
+    "https://animio.co,https://www.animio.co,https://animio.qzz.io,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173",
 ).split(",")
 API_KEY_NAME = "x-api-key"
 VALID_API_KEY = os.getenv("API_KEY")
@@ -193,10 +193,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_origin_regex=(
-        "https://.*\\.vercel\\.app|http://localhost:.*|http://127\\.0\\.0\\.1:.*|"
-        "https://ani-vanta\\.vercel\\.app|https://anizen\\.saugatthapa43\\.workers\\.dev|"
-        "https://animio\\.qzz\\.io|https://.*\\.qzz\\.io|"
-        "https?://.*"
+        "https://animio\\.co|https://www\\.animio\\.co|https://animio\\.qzz\\.io|"
+        "http://localhost:(3000|5173)|http://127\\.0\\.0\\.1:(3000|5173)"
     ),
     allow_credentials=True,
     allow_methods=["*"],
@@ -245,16 +243,16 @@ async def secure_api(request: Request, call_next):
         for val in [origin, referer]:
             if val:
                 val_lower = val.lower()
-                if val_lower.startswith("http://localhost:") or val_lower.startswith("http://127.0.0.1:"):
+                if val_lower.startswith("http://localhost:3000") or val_lower.startswith("http://localhost:5173"):
+                    is_allowed = True
+                    break
+                if val_lower.startswith("http://127.0.0.1:3000") or val_lower.startswith("http://127.0.0.1:5173"):
                     is_allowed = True
                     break
                 if (
-                    ".vercel.app" in val_lower
-                    or "ani-vanta" in val_lower
-                    or "anivanta" in val_lower
-                    or "anizen.saugatthapa43.workers.dev" in val_lower
-                    or "animio.qzz.io" in val_lower
-                    or ".qzz.io" in val_lower
+                    "https://animio.co" in val_lower
+                    or "https://www.animio.co" in val_lower
+                    or "https://animio.qzz.io" in val_lower
                 ):
                     is_allowed = True
                     break
@@ -862,9 +860,9 @@ async def _fetch_discord_bot_status() -> dict:
 MAINTENANCE_ALLOWED_PATHS = {
     "/maintenance/status",
     "/admin/maintenance/on",
-    "/presence/heartbeat",
     "/admin/maintenance/off",
     "/admin/maintenance/status",
+    "/presence/heartbeat",
     "/presence/count",
     "/bot/status",
     "/status/live",
@@ -1131,7 +1129,7 @@ def _merge_anizone_and_miruro_episodes(anilist_id: int, anizone_data: Optional[d
                 result["providers"]["anizone"] = {
                     "id": "anizone",
                     "name": "Anizone",
-                    "episodes": {"sub": anizone_eps, "dub": anizone_eps},
+                    "episodes": {"sub": anizone_eps, "dub": []},
                 }
                 result["episodes"]["sub"] = anizone_eps
 
@@ -1487,7 +1485,7 @@ def _anizone_episode_response(anilist_id: int, episodes: list[dict]) -> dict:
                 "sourceId": source_id,
             }
         )
-    return {"episodes": {"sub": items, "dub": items}}
+    return {"episodes": {"sub": items, "dub": []}}
 
 
 def _episode_slug_prefix(provider_name: str, episode_id, episode_number) -> str:
@@ -1927,6 +1925,131 @@ async def _attach_stream_proxy_candidates(payload: dict):
     return payload
 
 
+def _guess_quality_from_resolution(width: Optional[int], height: Optional[int]) -> Optional[str]:
+    if not height:
+        return None
+    if height >= 2160:
+        return "2160p"
+    if height >= 1440:
+        return "1440p"
+    if height >= 1080:
+        return "1080p"
+    if height >= 720:
+        return "720p"
+    if height >= 480:
+        return "480p"
+    if height >= 360:
+        return "360p"
+    if height >= 240:
+        return "240p"
+    return f"{height}p"
+
+
+def _hls_variant_url(master_url: str, variant_path: str) -> str:
+    return urljoin(master_url, variant_path.strip())
+
+
+def _parse_hls_master_variants(master_url: str, playlist_text: str) -> list[dict]:
+    variants = []
+    lines = [line.strip() for line in str(playlist_text or "").splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF"):
+            continue
+        next_url = None
+        for candidate in lines[index + 1:]:
+            if candidate.startswith("#"):
+                continue
+            next_url = candidate
+            break
+        if not next_url:
+            continue
+
+        resolution_match = re.search(r"RESOLUTION=(\d+)x(\d+)", line, flags=re.I)
+        bandwidth_match = re.search(r"(?:AVERAGE-)?BANDWIDTH=(\d+)", line, flags=re.I)
+        width = int(resolution_match.group(1)) if resolution_match else None
+        height = int(resolution_match.group(2)) if resolution_match else None
+        bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else None
+        quality = _guess_quality_from_resolution(width, height)
+        if not quality and bandwidth:
+            mbps = bandwidth / 1_000_000
+            quality = f"{mbps:.1f} Mbps".replace(".0 ", " ")
+
+        variants.append({
+            "quality": quality or "Auto",
+            "resolution": f"{width}x{height}" if width and height else None,
+            "bandwidth": bandwidth,
+            "url": _hls_variant_url(master_url, next_url),
+            "type": "hls",
+        })
+
+    variants.sort(key=lambda item: int(item.get("bandwidth") or 0), reverse=True)
+    return variants
+
+
+async def _fetch_hls_variants(stream_url: str, referer: Optional[str] = None) -> list[dict]:
+    if not stream_url or ".m3u8" not in str(stream_url).lower():
+        return []
+    cache_key = hashlib.sha1(str(stream_url).encode("utf-8", errors="ignore")).hexdigest()
+    cached = _get_cache("hls_variants", cache_key)
+    if cached is not None:
+        return cached or []
+
+    headers = dict(HEADERS)
+    parsed_host = urlparse(stream_url).netloc.lower()
+    if referer:
+        headers["Referer"] = referer
+    elif "vid-cdn.xyz" in parsed_host:
+        headers["Referer"] = "https://anizone.to/"
+    try:
+        async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
+            res = await client.get(stream_url, headers=headers)
+        if res.status_code != 200:
+            _set_cache("hls_variants", cache_key, [], ttl_hours=0.25)
+            return []
+        variants = _parse_hls_master_variants(stream_url, res.text)
+        _set_cache("hls_variants", cache_key, variants, ttl_hours=0.25)
+        return variants
+    except Exception:
+        _set_cache("hls_variants", cache_key, [], ttl_hours=0.1)
+        return []
+
+
+async def _annotate_stream_qualities(streams: list):
+    if not isinstance(streams, list) or not streams:
+        return
+
+    async def annotate_one(stream):
+        if not isinstance(stream, dict):
+            return
+        stream_url = stream.get("url")
+        stream_type = str(stream.get("type") or "").lower()
+        if "m3u8" not in str(stream_url).lower() and stream_type != "hls":
+            return
+        variants = await _fetch_hls_variants(stream_url, stream.get("referer"))
+        if not variants:
+            if not stream.get("quality") or str(stream.get("quality")).lower() in {"hls", "auto", "default"}:
+                stream["quality"] = "Auto"
+            return
+        stream["qualities"] = variants
+        if not stream.get("quality") or str(stream.get("quality")).lower() in {"hls", "auto", "default"}:
+            stream["quality"] = variants[0].get("quality") or "Auto"
+        stream["qualitySource"] = "hls-master"
+
+    await asyncio.gather(*(annotate_one(stream) for stream in streams))
+
+
+async def _annotate_source_payload_qualities(payload: dict):
+    if not isinstance(payload, dict):
+        return payload
+
+    await _annotate_stream_qualities(payload.get("streams"))
+    for key in ("ssub", "sub", "sdub", "dub"):
+        branch = payload.get(key)
+        if isinstance(branch, dict):
+            await _annotate_stream_qualities(branch.get("streams"))
+    return payload
+
+
 def _normalize_subtitle_entry(entry, fallback_index: int = 0) -> Optional[dict]:
     if isinstance(entry, str):
         url = entry.strip()
@@ -2285,6 +2408,12 @@ async def _prepare_source_payload(
 ) -> dict:
     """Keep playback fast by making optional enrichments non-blocking by default."""
     payload = await _attach_stream_proxy_candidates(payload)
+    try:
+        payload = await asyncio.wait_for(_annotate_source_payload_qualities(payload), timeout=7.0)
+    except asyncio.TimeoutError:
+        print(f"[HLS QUALITY TIMEOUT] {provider}/{episode_id}")
+    except Exception as exc:
+        print(f"[HLS QUALITY WARN] {provider}/{episode_id}: {exc}")
 
     if not ENABLE_SUBTITLE_FALLBACKS:
         return _apply_subtitle_mode_hints(payload, category)
@@ -3934,6 +4063,14 @@ async def stream_search(
             "idMal": mal_id,
             "title": title,
             "source": source,
+            "availableEpisodeCount": item.get("availableEpisodeCount"),
+            "subEpisodeCount": item.get("subEpisodeCount"),
+            "dubEpisodeCount": item.get("dubEpisodeCount"),
+            "latestSubEpisode": item.get("latestSubEpisode"),
+            "latestDubEpisode": item.get("latestDubEpisode"),
+            "totalEpisodeCount": item.get("totalEpisodeCount") or item.get("episodes"),
+            "latestEpisodeNumber": item.get("latestEpisodeNumber") or item.get("latestEpisode"),
+            "nextAiringEpisode": item.get("nextAiringEpisode"),
             "streamable": streamable,
             "watchUrl": watch_url,
             "fallbackSource": "jikan" if (source == "jikan" and not streamable) else None,
@@ -3986,6 +4123,14 @@ async def search_suggestions(
             "status": item.get("status"),
             "year": (item.get("startDate") or {}).get("year"),
             "episodes": item.get("episodes"),
+            "availableEpisodeCount": None,
+            "subEpisodeCount": None,
+            "dubEpisodeCount": None,
+            "latestSubEpisode": None,
+            "latestDubEpisode": None,
+            "totalEpisodeCount": item.get("episodes"),
+            "latestEpisodeNumber": None,
+            "nextAiringEpisode": None,
         })
     return _proxy_deep_images({"suggestions": results})
 
@@ -4890,6 +5035,13 @@ async def _fetch_latest_airing_episodes(page: int = 1, per_page: int = 20):
         seen.add(media_id)
         entry = dict(media)
         entry["latestEpisode"] = item.get("episode")
+        entry["latestEpisodeNumber"] = item.get("episode")
+        entry["availableEpisodeCount"] = item.get("episode")
+        entry["subEpisodeCount"] = item.get("episode")
+        entry["dubEpisodeCount"] = None
+        entry["latestSubEpisode"] = item.get("episode")
+        entry["latestDubEpisode"] = None
+        entry["totalEpisodeCount"] = media.get("episodes")
         entry["latestAiringAt"] = item.get("airingAt")
         results.append(entry)
         if len(results) >= per_page:
@@ -5351,10 +5503,21 @@ async def get_anime_relations(anilist_id: int):
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="Anime not found")
+    relation_edges = media.get("relations", {}).get("edges", [])
+    for edge in relation_edges:
+        node = edge.get("node") if isinstance(edge, dict) else None
+        if isinstance(node, dict):
+            node["totalEpisodeCount"] = node.get("episodes")
+            node.setdefault("availableEpisodeCount", None)
+            node.setdefault("subEpisodeCount", None)
+            node.setdefault("dubEpisodeCount", None)
+            node.setdefault("latestSubEpisode", None)
+            node.setdefault("latestDubEpisode", None)
+            node.setdefault("latestEpisodeNumber", None)
     response = {
         "id": media["id"],
         "title": media["title"],
-        "relations": media.get("relations", {}).get("edges", []),
+        "relations": relation_edges,
     }
     return _proxy_deep_images(response)
 
@@ -5399,13 +5562,24 @@ async def get_anime_recommendations(
     if not media:
         raise HTTPException(status_code=404, detail="Anime not found")
     recs = media.get("recommendations", {})
+    recommendation_nodes = recs.get("nodes", [])
+    for node in recommendation_nodes:
+        media_recommendation = node.get("mediaRecommendation") if isinstance(node, dict) else None
+        if isinstance(media_recommendation, dict):
+            media_recommendation["totalEpisodeCount"] = media_recommendation.get("episodes")
+            media_recommendation.setdefault("availableEpisodeCount", None)
+            media_recommendation.setdefault("subEpisodeCount", None)
+            media_recommendation.setdefault("dubEpisodeCount", None)
+            media_recommendation.setdefault("latestSubEpisode", None)
+            media_recommendation.setdefault("latestDubEpisode", None)
+            media_recommendation.setdefault("latestEpisodeNumber", None)
     page_info = recs.get("pageInfo", {})
     response = {
         "page": page_info.get("currentPage", page),
         "perPage": page_info.get("perPage", per_page),
         "total": page_info.get("total", 0),
         "hasNextPage": page_info.get("hasNextPage", False),
-        "recommendations": recs.get("nodes", []),
+        "recommendations": recommendation_nodes,
     }
     return _proxy_deep_images(response)
 
@@ -5452,6 +5626,7 @@ async def _anizone_title_candidates(anilist_id: int) -> dict:
     query ($id: Int) {
       Media(id: $id, type: ANIME) {
         id
+        idMal
         title { romaji english native }
         synonyms
         seasonYear
@@ -5470,6 +5645,26 @@ async def _anizone_title_candidates(anilist_id: int) -> dict:
     for value in media.get("synonyms") or []:
         if value and value.isascii() and value not in titles:
             titles.append(value)
+
+    mal_id = media.get("idMal")
+    if mal_id:
+        try:
+            jikan_data = await _jikan_anime_by_mal(mal_id)
+            if isinstance(jikan_data, dict):
+                for key in ("title", "title_english", "title_japanese"):
+                    val = jikan_data.get(key)
+                    if val and val.isascii() and val not in titles:
+                        titles.append(val)
+                for entry in jikan_data.get("titles") or []:
+                    val = entry.get("title") if isinstance(entry, dict) else None
+                    if val and val.isascii() and val not in titles:
+                        titles.append(val)
+                for synonym in jikan_data.get("synonyms") or []:
+                    if synonym and synonym.isascii() and synonym not in titles:
+                        titles.append(synonym)
+        except Exception:
+            pass
+
     return {
         "titles": titles,
         "year": media.get("seasonYear") or (media.get("startDate") or {}).get("year"),
@@ -5599,6 +5794,8 @@ async def get_episodes(
     start: int = Query(1, ge=1, description="Episode range start (1-indexed)"),
     limit: int = Query(100, ge=1, le=500, description="Number of episodes to return (used only if end is not set)"),
     end: Optional[int] = Query(None, ge=1, description="Episode range end (inclusive). Overrides limit if set."),
+    provider: str = Query(PRIMARY_STREAM_PROVIDER, description="Primary episode provider for provider-aware cache keys"),
+    forceRefresh: bool = Query(False, description="Bypass episode cache for this request"),
 ):
     """Get the episode list merging Anizone + Miruro providers.
     Supports range-based lazy loading via start/end or start/limit.
@@ -5609,7 +5806,58 @@ async def get_episodes(
         if end < start:
             end = start
         limit = min(end - start + 1, 500)
-    print(f"[episodes] anilist_id={anilist_id}, start={start}, limit={limit}, end={end}")
+    provider_key = (provider or PRIMARY_STREAM_PROVIDER or "anizone").strip().lower()
+    print(f"[episodes] anilist_id={anilist_id}, provider={provider_key}, start={start}, limit={limit}, end={end}, forceRefresh={forceRefresh}")
+
+    def annotate_episode_counts(payload: dict, total_episode_count: Optional[int] = None) -> dict:
+        sub_episode_numbers = []
+        dub_episode_numbers = []
+
+        def collect(ep_list, target):
+            if not isinstance(ep_list, list):
+                return
+            for ep in ep_list:
+                if not isinstance(ep, dict):
+                    continue
+                value = ep.get("number") or ep.get("episode") or ep.get("episodeNumber")
+                try:
+                    number = int(float(value))
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    target.append(number)
+
+        top_eps = payload.get("episodes")
+        if isinstance(top_eps, dict):
+            collect(top_eps.get("sub"), sub_episode_numbers)
+            collect(top_eps.get("dub"), dub_episode_numbers)
+        elif isinstance(top_eps, list):
+            collect(top_eps, sub_episode_numbers)
+
+        for provider_data in (payload.get("providers") or {}).values():
+            episodes = provider_data.get("episodes") if isinstance(provider_data, dict) else None
+            if isinstance(episodes, dict):
+                collect(episodes.get("sub"), sub_episode_numbers)
+                collect(episodes.get("dub"), dub_episode_numbers)
+            elif isinstance(episodes, list):
+                collect(episodes, sub_episode_numbers)
+
+        sub_numbers = set(sub_episode_numbers)
+        dub_numbers = set(dub_episode_numbers)
+        all_numbers = sub_numbers | dub_numbers
+        latest_sub_episode = max(sub_numbers) if sub_numbers else None
+        latest_dub_episode = max(dub_numbers) if dub_numbers else None
+        latest_episode = max(all_numbers) if all_numbers else None
+        available_count = len(all_numbers) if all_numbers else None
+        payload["subEpisodeCount"] = len(sub_numbers) if sub_numbers else None
+        payload["dubEpisodeCount"] = len(dub_numbers) if dub_numbers else None
+        payload["latestSubEpisode"] = latest_sub_episode
+        payload["latestDubEpisode"] = latest_dub_episode
+        payload["availableEpisodeCount"] = available_count
+        payload["latestEpisodeNumber"] = latest_episode
+        payload["totalEpisodeCount"] = total_episode_count if total_episode_count else payload.get("totalEpisodeCount")
+        return payload
+
     async def fetch_fn():
         warnings = []
         anizone_data = None
@@ -5700,15 +5948,22 @@ async def get_episodes(
 
         result = _order_stream_providers(result)
         result = _proxy_deep_images(result)
+        result = annotate_episode_counts(result, integrity_context.get("episodes") if isinstance(integrity_context, dict) else None)
         result["warnings"] = warnings
         return result
 
     async def integrity_fetch_fn():
-        return await _cached_response("episode_integrity:v2", 43200, fetch_fn, str(anilist_id), str(start), str(limit))
+        if forceRefresh:
+            return await fetch_fn()
+        return await _cached_response("episode_integrity:v3", 300, fetch_fn, provider_key, str(anilist_id), str(start), str(limit))
 
-    full_data = await _cached_response("episodes:v7", 43200, integrity_fetch_fn, str(anilist_id), str(start), str(limit))
+    if forceRefresh:
+        full_data = await integrity_fetch_fn()
+    else:
+        full_data = await _cached_response("episodes:v9", 300, integrity_fetch_fn, provider_key, str(anilist_id), str(start), str(limit))
     sliced = _slice_episode_data(full_data, start, limit)
     ordered = _order_stream_providers(_remove_disabled_stream_providers(sliced))
+    ordered = annotate_episode_counts(ordered, full_data.get("totalEpisodeCount") if isinstance(full_data, dict) else None)
     if str(anilist_id) in DEBUG_EPISODE_ANIME_IDS:
         debug_summary = {}
         for provider_name, provider_data in (ordered.get("providers") or {}).items():
@@ -5723,6 +5978,91 @@ async def get_episodes(
             debug_summary[provider_name] = sorted(set(nums))
         print(f"[Episodes Debug] anilist_id={anilist_id} providers={debug_summary}")
     return ordered
+
+
+async def invalidateEpisodesCache(anilistId: Optional[int] = None, provider: str = PRIMARY_STREAM_PROVIDER) -> dict:
+    provider_key = (provider or PRIMARY_STREAM_PROVIDER or "anizone").strip().lower()
+    prefixes = ("episodes:v9", "episode_integrity:v3")
+    memory_deleted = 0
+    redis_deleted = 0
+    match_parts = [provider_key]
+    if anilistId is not None:
+      match_parts.append(str(anilistId))
+
+    bucket = _memory_cache.get("_cached_response") or {}
+    for mem_key in list(bucket.keys()):
+        if not any(f"_cached:{prefix}:" in mem_key for prefix in prefixes):
+            continue
+        if all(f":{part}" in mem_key for part in match_parts):
+            bucket.pop(mem_key, None)
+            memory_deleted += 1
+
+    r = await _get_redis()
+    if r:
+        try:
+            for prefix in prefixes:
+                if anilistId is not None:
+                    patterns = [
+                        _redis_key(prefix, provider_key, str(anilistId), "*"),
+                        f"stale:{_redis_key(prefix, provider_key, str(anilistId), '*')}",
+                    ]
+                else:
+                    patterns = [
+                        _redis_key(prefix, provider_key, "*"),
+                        f"stale:{_redis_key(prefix, provider_key, '*')}",
+                    ]
+                for pattern in patterns:
+                    async for key in r.scan_iter(match=pattern, count=100):
+                        await r.delete(key)
+                        redis_deleted += 1
+        except Exception as exc:
+            print(f"[Episode Cache] Redis invalidation failed: {exc}")
+
+    return {
+        "ok": True,
+        "provider": provider_key,
+        "anilistId": anilistId,
+        "memoryDeleted": memory_deleted,
+        "redisDeleted": redis_deleted,
+    }
+
+
+@app.post("/admin/cache/invalidate/episodes")
+async def invalidate_episodes_cache_endpoint(
+    anilistId: Optional[int] = Query(None),
+    provider: str = Query(PRIMARY_STREAM_PROVIDER),
+):
+    return await invalidateEpisodesCache(anilistId=anilistId, provider=provider)
+
+
+@app.get("/api/download/episode")
+async def download_episode(
+    animeId: str = Query(...),
+    episodeId: str = Query(...),
+    quality: str = Query("720p"),
+    provider: str = Query(PRIMARY_STREAM_PROVIDER),
+):
+    return {
+        "available": False,
+        "reason": "Download not available for this source",
+        "quality": quality,
+        "provider": (provider or PRIMARY_STREAM_PROVIDER or "anizone").strip().lower(),
+    }
+
+
+@app.get("/api/download/season")
+async def download_season(
+    animeId: str = Query(...),
+    quality: str = Query("720p"),
+    provider: str = Query(PRIMARY_STREAM_PROVIDER),
+):
+    return {
+        "available": False,
+        "reason": "Season download is not available for this source",
+        "quality": quality,
+        "provider": (provider or PRIMARY_STREAM_PROVIDER or "anizone").strip().lower(),
+        "episodes": [],
+    }
 
 
 @app.get("/episodes-by-mal/{malId}")
@@ -5754,7 +6094,12 @@ async def anizone_episodes(url: str = Query(..., description="Anizone anime URL 
 @app.get("/anizone/sources")
 async def anizone_sources(url: str = Query(..., description="Anizone episode URL or base64-url encoded URL")):
     try:
-        return await _anizone_sources_cached(url)
+        data = await _anizone_sources_cached(url)
+        try:
+            data = await asyncio.wait_for(_annotate_source_payload_qualities(data), timeout=7.0)
+        except Exception:
+            pass
+        return data
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid Anizone URL")
     except Exception:
@@ -5777,6 +6122,10 @@ async def get_sources(
             episode_url = _decode_anizone_episode_id(episodeId)
             data = await _anizone_sources_cached(episode_url)
             data["provider"] = "anizone"
+            try:
+                data = await asyncio.wait_for(_annotate_source_payload_qualities(data), timeout=7.0)
+            except Exception:
+                pass
             return _proxy_deep_images(data)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid Anizone URL")

@@ -8,10 +8,12 @@ def _csv(value: str) -> list[str]:
 
 
 PRIMARY_STREAM_PROVIDER = os.getenv("PRIMARY_STREAM_PROVIDER", "anizone").strip().lower() or "anizone"
+MAIN_STREAM_PROVIDERS = _csv(os.getenv("MAIN_STREAM_PROVIDERS", "anizone,bonk,ally"))
+BACKUP_STREAM_PROVIDERS = _csv(os.getenv("BACKUP_STREAM_PROVIDERS", "dune,bee,hop,arc,zoro"))
 STREAM_PROVIDER_ORDER = _csv(
     os.getenv(
         "STREAM_PROVIDER_ORDER",
-        "anizone,bonk,ally,dune,bee,hop,arc,zoro,jet,kiwi,animekai,mkissa",
+        ",".join([*MAIN_STREAM_PROVIDERS, *BACKUP_STREAM_PROVIDERS, "jet", "kiwi", "moo", "animekai", "mkissa"]),
     )
 )
 
